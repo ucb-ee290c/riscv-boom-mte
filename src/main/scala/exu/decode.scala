@@ -15,6 +15,7 @@ import freechips.rocketchip.rocket.CustomInstructions._
 import freechips.rocketchip.rocket.RVCExpander
 import freechips.rocketchip.rocket.{CSR,Causes}
 import freechips.rocketchip.util.{uintToBitPat,UIntIsOneOf}
+import boom.common.MTEInstructions._
 
 import FUConstants._
 import boom.common._
@@ -405,9 +406,11 @@ object FDivSqrtDecode extends DecodeConstants
 //scalastyle:on
 
 /**
- * RoCC initial decode
+ * RoCC initial decode EXCEPT it does not contain the custom-3 opcode space
+ * This is to be used if another extension demands the custom-3 opcode (such as
+ * MTE).
  */
-object RoCCDecode extends DecodeConstants
+object RoCCDecodeNoCustom3 extends DecodeConstants
 {
   // Note: We use FU_CSR since CSR instructions cannot co-execute with RoCC instructions
                        //                                                                   frs3_en                        wakeup_delay
@@ -442,15 +445,51 @@ object RoCCDecode extends DecodeConstants
     CUSTOM2_RD_RS1_RS2 ->List(Y, N, X, uopROCC   , IQT_INT, FU_CSR, RT_FIX, RT_FIX, RT_FIX, N, IS_X, N, N, N, N, N, M_X  , 0.U, N, N, N, N, N, CSR.N),
     CUSTOM3            ->List(Y, N, X, uopROCC   , IQT_INT, FU_CSR, RT_X  , RT_X  , RT_X  , N, IS_X, N, N, N, N, N, M_X  , 0.U, N, N, N, N, N, CSR.N),
     CUSTOM3_RS1        ->List(Y, N, X, uopROCC   , IQT_INT, FU_CSR, RT_X  , RT_FIX, RT_X  , N, IS_X, N, N, N, N, N, M_X  , 0.U, N, N, N, N, N, CSR.N),
-    CUSTOM3_RS1_RS2    ->List(Y, N, X, uopROCC   , IQT_INT, FU_CSR, RT_X  , RT_FIX, RT_FIX, N, IS_X, N, N, N, N, N, M_X  , 0.U, N, N, N, N, N, CSR.N),
+    CUSTOM3_RS1_RS2    ->List(Y, N, X, uopROCC   , IQT_INT, FU_CSR, RT_X  , RT_FIX, RT_FIX, N, IS_X, N, N, N, N, N, M_X  , 0.U, N, N, N, N, N, CSR.N))
+}
+
+/**
+ * RoCC initial decode's custom-3 opcode space. Mix this in if the opcode-3 
+ * space is available
+ */
+object RoCCDecodeCustom3 extends DecodeConstants
+{
+  // Note: We use FU_CSR since CSR instructions cannot co-execute with RoCC instructions
+                       //                                                                   frs3_en                        wakeup_delay
+                       //     is val inst?                                                  |  imm sel                     |    bypassable (aka, known/fixed latency)
+                       //     |  is fp inst?                                                |  |     uses_ldq              |    |  is_br
+                       //     |  |  is single-prec                          rs1 regtype     |  |     |  uses_stq           |    |  |
+                       //     |  |  |                                       |       rs2 type|  |     |  |  is_amo          |    |  |
+                       //     |  |  |  micro-code           func unit       |       |       |  |     |  |  |  is_fence     |    |  |
+                       //     |  |  |  |           iq-type  |               |       |       |  |     |  |  |  |  is_fencei |    |  |  is breakpoint or ecall?
+                       //     |  |  |  |           |        |       dst     |       |       |  |     |  |  |  |  |  mem    |    |  |  |  is unique? (clear pipeline for it)
+                       //     |  |  |  |           |        |       regtype |       |       |  |     |  |  |  |  |  cmd    |    |  |  |  |  flush on commit
+                       //     |  |  |  |           |        |       |       |       |       |  |     |  |  |  |  |  |      |    |  |  |  |  |  csr cmd
+                       //     |  |  |  |           |        |       |       |       |       |  |     |  |  |  |  |  |      |    |  |  |  |  |  |
+  val table: Array[(BitPat, List[BitPat])] = Array(//       |       |       |       |       |  |     |  |  |  |  |  |      |    |  |  |  |  |  |
     CUSTOM3_RD         ->List(Y, N, X, uopROCC   , IQT_INT, FU_CSR, RT_FIX, RT_X  , RT_X  , N, IS_X, N, N, N, N, N, M_X  , 0.U, N, N, N, N, N, CSR.N),
     CUSTOM3_RD_RS1     ->List(Y, N, X, uopROCC   , IQT_INT, FU_CSR, RT_FIX, RT_FIX, RT_X  , N, IS_X, N, N, N, N, N, M_X  , 0.U, N, N, N, N, N, CSR.N),
-    CUSTOM3_RD_RS1_RS2 ->List(Y, N, X, uopROCC   , IQT_INT, FU_CSR, RT_FIX, RT_FIX, RT_FIX, N, IS_X, N, N, N, N, N, M_X  , 0.U, N, N, N, N, N, CSR.N)
-  )
+    CUSTOM3_RD_RS1_RS2 ->List(Y, N, X, uopROCC   , IQT_INT, FU_CSR, RT_FIX, RT_FIX, RT_FIX, N, IS_X, N, N, N, N, N, M_X  , 0.U, N, N, N, N, N, CSR.N))    
 }
 
 
 
+object MTEDecode extends DecodeConstants
+{
+           //                                                                    frs3_en                        wakeup_delay
+           //     is val inst?                                                   |  imm sel                     |    bypassable (aka, known/fixed latency)
+           //     |  is fp inst?                                                 |  |     uses_ldq              |    |  is_br
+           //     |  |  is single-prec?                          rs1 regtype     |  |     |  uses_stq           |    |  |
+           //     |  |  |  micro-code                            |       rs2 type|  |     |  |  is_amo          |    |  |
+           //     |  |  |  |           iq-type  func unit        |       |       |  |     |  |  |  is_fence     |    |  |
+           //     |  |  |  |           |        |                |       |       |  |     |  |  |  |  is_fencei |    |  |  is breakpoint or ecall?
+           //     |  |  |  |           |        |        dst     |       |       |  |     |  |  |  |  |  mem    |    |  |  |  is unique? (clear pipeline for it)
+           //     |  |  |  |           |        |        regtype |       |       |  |     |  |  |  |  |  cmd    |    |  |  |  |  flush on commit
+           //     |  |  |  |           |        |        |       |       |       |  |     |  |  |  |  |  |      |    |  |  |  |  |  csr cmd
+  val table: Array[(BitPat, List[BitPat])] = Array(//    |       |       |       |  |     |  |  |  |  |  |      |    |  |  |  |  |  |
+  MTE_ADD -> List(Y, N, X, uopMTE_ADD, IQT_INT, FU_ALU , RT_FIX, RT_FIX, RT_FIX, N, IS_X, N, N, N, N, N, M_X  , 1.U, Y, N, N, N, N, CSR.N)
+  )
+}
 
 
 /**
@@ -482,7 +521,13 @@ class DecodeUnit(implicit p: Parameters) extends BoomModule
   var decode_table = XDecode.table
   if (usingFPU) decode_table ++= FDecode.table
   if (usingFPU && usingFDivSqrt) decode_table ++= FDivSqrtDecode.table
-  if (usingRoCC) decode_table ++= RoCCDecode.table
+  if (usingRoCC) {
+    decode_table ++= RoCCDecodeNoCustom3.table
+    if (!useMTE) {
+      decode_table ++= RoCCDecodeCustom3.table
+    }
+  }
+  if (useMTE) decode_table ++= MTEDecode.table
   decode_table ++= (if (xLen == 64) X64Decode.table else X32Decode.table)
 
   val inst = uop.inst
