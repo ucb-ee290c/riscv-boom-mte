@@ -111,7 +111,10 @@ object AluRRdDecode extends RRdDecodeConstants
          BitPat(uopBGE)   -> List(BR_GE ,Y, N, N, FN_SLT , DW_XPR, OP1_X   , OP2_X   , IS_B, REN_0, CSR.N),
          BitPat(uopBGEU)  -> List(BR_GEU,Y, N, N, FN_SLTU, DW_XPR, OP1_X   , OP2_X   , IS_B, REN_0, CSR.N),
          BitPat(uopBLT)   -> List(BR_LT ,Y, N, N, FN_SLT , DW_XPR, OP1_X   , OP2_X   , IS_B, REN_0, CSR.N),
-         BitPat(uopBLTU)  -> List(BR_LTU,Y, N, N, FN_SLTU, DW_XPR, OP1_X   , OP2_X   , IS_B, REN_0, CSR.N))
+         BitPat(uopBLTU)  -> List(BR_LTU,Y, N, N, FN_SLTU, DW_XPR, OP1_X   , OP2_X   , IS_B, REN_0, CSR.N),
+         
+         /* MTE_ADD uses the ALU for add and we simply splice in the tag bits */
+         BitPat(uopMTE_ADD)-> List(BR_N , Y, N, N, FN_ADD, DW_XPR, OP1_RS1 , OP2_RS2 , IS_X, REN_1, CSR.N))
 }
 
 object JmpRRdDecode extends RRdDecodeConstants
