@@ -567,7 +567,15 @@ class WithNSmallMTEBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) exten
               ftq = FtqParameters(nEntries=16),
               nPerfCounters = 2,
               fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true)),
-              useMTE = true
+              useMTE = true,
+              mteRegions = List(
+                /* Region 0 = default DRAM */
+                //TODO: Add support for overriding this/put safer defaults
+                BoomMTERegion(
+                  base = 0x80000000L,
+                  size = 268435456
+                )
+              )
             ),
             dcache = Some(
               DCacheParams(rowBits = site(SystemBusKey).beatBits, nSets=64, nWays=4, nMSHRs=2, nTLBWays=8)
