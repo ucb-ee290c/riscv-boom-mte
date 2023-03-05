@@ -476,18 +476,18 @@ object RoCCDecodeCustom3 extends DecodeConstants
 
 object MTEDecode extends DecodeConstants
 {
-           //                                                                    frs3_en                        wakeup_delay
-           //     is val inst?                                                   |  imm sel                     |    bypassable (aka, known/fixed latency)
-           //     |  is fp inst?                                                 |  |     uses_ldq              |    |  is_br
-           //     |  |  is single-prec?                          rs1 regtype     |  |     |  uses_stq           |    |  |
-           //     |  |  |  micro-code                            |       rs2 type|  |     |  |  is_amo          |    |  |
-           //     |  |  |  |           iq-type  func unit        |       |       |  |     |  |  |  is_fence     |    |  |
-           //     |  |  |  |           |        |                |       |       |  |     |  |  |  |  is_fencei |    |  |  is breakpoint or ecall?
-           //     |  |  |  |           |        |        dst     |       |       |  |     |  |  |  |  |  mem    |    |  |  |  is unique? (clear pipeline for it)
-           //     |  |  |  |           |        |        regtype |       |       |  |     |  |  |  |  |  cmd    |    |  |  |  |  flush on commit
-           //     |  |  |  |           |        |        |       |       |       |  |     |  |  |  |  |  |      |    |  |  |  |  |  csr cmd
-  val table: Array[(BitPat, List[BitPat])] = Array(//    |       |       |       |  |     |  |  |  |  |  |      |    |  |  |  |  |  |
-  MTE_ADD -> List(Y, N, X, uopMTE_ADD, IQT_INT, FU_ALU , RT_FIX, RT_FIX, RT_FIX, N, IS_X, N, N, N, N, N, M_X  , 1.U, Y, N, N, N, N, CSR.N)
+               //                                                                        frs3_en                        wakeup_delay
+               //     is val inst?                                                       |  imm sel                     |    bypassable (aka, known/fixed latency)
+               //     |  is fp inst?                                                     |  |     uses_ldq              |    |  is_br
+               //     |  |  is single-prec?                              rs1 regtype     |  |     |  uses_stq           |    |  |
+               //     |  |  |  micro-code                                |       rs2 type|  |     |  |  is_amo          |    |  |
+               //     |  |  |  |               iq-type  func unit        |       |       |  |     |  |  |  is_fence     |    |  |
+               //     |  |  |  |               |        |                |       |       |  |     |  |  |  |  is_fencei |    |  |  is breakpoint or ecall?
+               //     |  |  |  |               |        |        dst     |       |       |  |     |  |  |  |  |  mem    |    |  |  |  is unique? (clear pipeline for it)
+               //     |  |  |  |               |        |        regtype |       |       |  |     |  |  |  |  |  cmd    |    |  |  |  |  flush on commit
+               //     |  |  |  |               |        |        |       |       |       |  |     |  |  |  |  |  |      |    |  |  |  |  |  csr cmd
+  val table: Array[(BitPat, List[BitPat])] = Array(//   |        |       |       |       |  |  |  |  |  |  |  |  |      |    |  |  |  |  |  |
+  MTE_ADD     -> List(Y, N, X, uopMTE_ADD    , IQT_INT, FU_ALU , RT_FIX, RT_FIX, RT_FIX, N, IS_X, N, N, N, N, N, M_X  , 1.U, Y, N, N, N, N, CSR.N)
   )
 }
 
