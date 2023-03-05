@@ -274,14 +274,15 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   // We use the bidirectional to transparently wire up the Writable instances
   (custom_csrs.csrs zip csr.io.customCSRs).map { case (lhs, rhs) => lhs <> rhs }
 
-  val faCSR = custom_csrs.getWritableOpt(custom_csrs.mmte_faCSR).get
-  faCSR.wport_wen := false.B
-  faCSR.wport_wdata := DontCare  
+  if (useMTE) {
+    val faCSR = custom_csrs.getWritableOpt(custom_csrs.smte_faCSR).get
+    faCSR.wport_wen := false.B
+    faCSR.wport_wdata := DontCare  
 
-
-  val fpcCSR = custom_csrs.getWritableOpt(custom_csrs.mmte_fpcCSR).get
-  fpcCSR.wport_wen := false.B
-  fpcCSR.wport_wdata := DontCare  
+    val fpcCSR = custom_csrs.getWritableOpt(custom_csrs.smte_fpcCSR).get
+    fpcCSR.wport_wen := false.B
+    fpcCSR.wport_wdata := DontCare  
+  }
 
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
   val icache_blocked = false.B

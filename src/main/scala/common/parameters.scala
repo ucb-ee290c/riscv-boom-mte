@@ -150,43 +150,43 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     }
   }
 
-  def mmte_configCSR: Option[CustomCSR] = {
+  def smte_configCSR: Option[CustomCSR] = {
     val mask = BigInt(
-      MTECSRs.mmte_config_enableMask << MTECSRs.mmte_config_enableShift |
+      MTECSRs.smte_config_enableMask << MTECSRs.smte_config_enableShift |
       //TODO: We don't currently support sync and we don't plan to. RAZ/WI
-      // MTECSRs.mmte_config_enforceSyncMask << MTECSRs.mmte_config_enforceSyncShift |
-      MTECSRs.mmte_config_permissiveTagMask << MTECSRs.mmte_config_permissiveTagShift
+      // MTECSRs.smte_config_enforceSyncMask << MTECSRs.smte_config_enforceSyncShift |
+      MTECSRs.smte_config_permissiveTagMask << MTECSRs.smte_config_permissiveTagShift
     )
 
     val init = BigInt(
-      0 << MTECSRs.mmte_config_enableShift |
-      0 << MTECSRs.mmte_config_enforceSyncShift |
-      0 << MTECSRs.mmte_config_permissiveTagShift
+      0 << MTECSRs.smte_config_enableShift |
+      0 << MTECSRs.smte_config_enforceSyncShift |
+      0 << MTECSRs.smte_config_permissiveTagShift
     )
-    mteCSRGen(MTECSRs.mmte_configID, mask, init)
+    mteCSRGen(MTECSRs.smte_configID, mask, init)
   }
 
-  def mmte_faCSR : Option[CustomCSR] = 
-    mteCSRGen(MTECSRs.mmte_faID, xLenMask, 0, true)
+  def smte_faCSR : Option[CustomCSR] = 
+    mteCSRGen(MTECSRs.smte_faID, xLenMask, 0, true)
   
-  def mmte_fpcCSR : Option[CustomCSR] = 
-    mteCSRGen(MTECSRs.mmte_fpcID, xLenMask, 1, true)
+  def smte_fpcCSR : Option[CustomCSR] = 
+    mteCSRGen(MTECSRs.smte_fpcID, xLenMask, 1, true)
 
-  def mmte_tagSeedCSR : Option[CustomCSR] = 
-    mteCSRGen(MTECSRs.mmte_tag_seedID, xLenMask, 0)
+  def smte_tagSeedCSR : Option[CustomCSR] = 
+    mteCSRGen(MTECSRs.smte_tag_seedID, xLenMask, 0)
 
-  def mmte_tagbases : Seq[CustomCSR] = MTECSRs.mmte_tagbaseIDs.flatMap {
+  def smte_tagbases : Seq[CustomCSR] = MTECSRs.smte_tagbaseIDs.flatMap {
     csr_id =>
     mteCSRGen(csr_id, xLenMask, 0)
   }
 
-  def mmte_tagmasks : Seq[CustomCSR] = MTECSRs.mmte_tagmaskIDs.flatMap {
+  def smte_tagmasks : Seq[CustomCSR] = MTECSRs.smte_tagmaskIDs.flatMap {
     csr_id =>
     mteCSRGen(csr_id, xLenMask, 0)
   }
 
-  override def decls = super.decls ++ mmte_configCSR ++ mmte_faCSR ++ 
-    mmte_fpcCSR ++ mmte_tagSeedCSR ++ mmte_tagbases ++ mmte_tagmasks
+  override def decls = super.decls ++ smte_configCSR ++ smte_faCSR ++ 
+    smte_fpcCSR ++ smte_tagSeedCSR ++ smte_tagbases ++ smte_tagmasks
 
   def disableOOO = getOrElse(chickenCSR, _.value(3), true.B)
 
