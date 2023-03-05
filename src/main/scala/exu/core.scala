@@ -38,6 +38,7 @@ import freechips.rocketchip.rocket.Instructions._
 import freechips.rocketchip.rocket.{Causes, PRV}
 import freechips.rocketchip.util.{Str, UIntIsOneOf, CoreMonitorBundle}
 import freechips.rocketchip.devices.tilelink.{PLICConsts, CLINTConsts}
+import freechips.rocketchip.tile._
 
 import testchipip.{ExtendedTracedInstruction}
 
@@ -270,7 +271,17 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   csr.io.rocc_interrupt := io.rocc.interrupt
 
   val custom_csrs = Wire(new BoomCustomCSRs)
-  (custom_csrs.csrs zip csr.io.customCSRs).map { case (lhs, rhs) => lhs := rhs }
+  // We use the bidirectional to transparently wire up the Writable instances
+  (custom_csrs.csrs zip csr.io.customCSRs).map { case (lhs, rhs) => lhs <> rhs }
+
+  val faCSR = custom_csrs.getWritableOpt(custom_csrs.mmte_faCSR).get
+  faCSR.wport_wen := false.B
+  faCSR.wport_wdata := DontCare  
+
+
+  val fpcCSR = custom_csrs.getWritableOpt(custom_csrs.mmte_fpcCSR).get
+  fpcCSR.wport_wen := false.B
+  fpcCSR.wport_wdata := DontCare  
 
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
   val icache_blocked = false.B

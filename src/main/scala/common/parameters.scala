@@ -18,6 +18,7 @@ import freechips.rocketchip.devices.tilelink.{BootROMParams, CLINTParams, PLICPa
 import boom.ifu._
 import boom.exu._
 import boom.lsu._
+import boom.common._
 
 /**
  * Default BOOM core parameters
@@ -137,7 +138,71 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     )
     Some(CustomCSR(chickenCSRId, mask, Some(init)))
   }
+
+  /* xLen 1s, suitable for masking max size VAs */
+  private val xLenMask = BigInt((1 << xLen) - 1)
+  private def mteCSRGen(id: Int, mask: BigInt, init: BigInt, hasWritePort:Boolean = false): Option[CustomCSR] = {
+    /* Don't generate MTE CSRs if we don't have MTE enabled for this core */
+    if (useMTE) {
+      Some({CustomCSR(id, mask, Some(init), hasWritePort)})
+    } else {
+      None
+    }
+  }
+
+  def mmte_configCSR: Option[CustomCSR] = {
+    val mask = BigInt(
+      MTECSRs.mmte_config_enableMask << MTECSRs.mmte_config_enableShift |
+      //TODO: We don't currently support sync and we don't plan to. RAZ/WI
+      // MTECSRs.mmte_config_enforceSyncMask << MTECSRs.mmte_config_enforceSyncShift |
+      MTECSRs.mmte_config_permissiveTagMask << MTECSRs.mmte_config_permissiveTagShift
+    )
+
+    val init = BigInt(
+      0 << MTECSRs.mmte_config_enableShift |
+      0 << MTECSRs.mmte_config_enforceSyncShift |
+      0 << MTECSRs.mmte_config_permissiveTagShift
+    )
+    mteCSRGen(MTECSRs.mmte_configID, mask, init)
+  }
+
+  def mmte_faCSR : Option[CustomCSR] = 
+    mteCSRGen(MTECSRs.mmte_faID, xLenMask, 0, true)
+  
+  def mmte_fpcCSR : Option[CustomCSR] = 
+    mteCSRGen(MTECSRs.mmte_fpcID, xLenMask, 1, true)
+
+  def mmte_tagSeedCSR : Option[CustomCSR] = 
+    mteCSRGen(MTECSRs.mmte_tag_seedID, xLenMask, 0)
+
+  def mmte_tagbases : Seq[CustomCSR] = MTECSRs.mmte_tagbaseIDs.flatMap {
+    csr_id =>
+    mteCSRGen(csr_id, xLenMask, 0)
+  }
+
+  def mmte_tagmasks : Seq[CustomCSR] = MTECSRs.mmte_tagmaskIDs.flatMap {
+    csr_id =>
+    mteCSRGen(csr_id, xLenMask, 0)
+  }
+
+  override def decls = super.decls ++ mmte_configCSR ++ mmte_faCSR ++ 
+    mmte_fpcCSR ++ mmte_tagSeedCSR ++ mmte_tagbases ++ mmte_tagmasks
+
   def disableOOO = getOrElse(chickenCSR, _.value(3), true.B)
+
+  // Returns the writable IO port for a CustomCSR definition if that CSR is both
+  // enabled and writable in this configuration 
+  def getWritableOpt(csr:Option[CustomCSR]): Option[CustomCSRIOWritable] = {
+    csr match {
+      case Some(csr) => 
+        (decls zip csrs).find {case (c_def, c_io) => c_def.id == csr.id } match {
+          case Some((decls, c_io_writable : CustomCSRIOWritable)) => 
+            Some(c_io_writable)
+          case _ => None
+        }
+      case None => None
+    }
+  }
 }
 
 /**
