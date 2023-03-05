@@ -270,6 +270,32 @@ abstract class PipelinedFunctionalUnit(
   }
 }
 
+class MTEALUAddOnUnit(dataWidth:Int)(implicit p: Parameters)
+  extends Module
+{
+  val io = IO(new Bundle {
+      val req     = Input(new DecoupledIO(new FuncUnitReq(dataWidth)))
+      val alu_out = Input(UInt(dataWidth.W))
+      val imm     = Input(UInt(dataWidth.W))
+      val out     = Output(UInt(dataWidth.W))
+      val valid   = Output(Bool())
+  })
+
+  val rs1 = io.req.bits.rs1_data
+  val rs2 = io.req.bits.rs2_data
+  val uop = io.req.bits.uop
+  val uopc = uop.uopc
+  when (uopc === uopMTE_ADD) {
+    io.valid := true.B
+    /* Take the result of the add but preserve the tags from the original Rs1 */
+    io.out := Cat(rs1(63, 60), io.alu_out(59, 0))
+  } 
+  .otherwise {
+    io.valid := false.B
+    io.out := DontCare
+  }
+}
+
 /**
  * Functional unit that wraps RocketChips ALU
  *
@@ -320,6 +346,17 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
   alu.io.in2 := op2_data.asUInt
   alu.io.fn  := uop.ctrl.op_fcn
   alu.io.dw  := uop.ctrl.fcn_dw
+
+
+  val mteAddOn = if (useMTE) Module(new MTEALUAddOnUnit(dataWidth)) else null
+  val mteAddOnValid = if (useMTE) mteAddOn.io.valid else false.B
+  val mteAddOnOut = if (useMTE) mteAddOn.io.out else DontCare
+  if (useMTE) {
+    mteAddOn.io.req     := io.req
+    mteAddOn.io.alu_out := alu.io.out
+    mteAddOn.io.imm := imm_xprlen.asUInt
+  }
+
 
 
   // Did I just get killed by the previous cycle's branch,
@@ -436,11 +473,10 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
   val r_val  = RegInit(VecInit(Seq.fill(numStages) { false.B }))
   val r_data = Reg(Vec(numStages, UInt(xLen.W)))
   val r_pred = Reg(Vec(numStages, Bool()))
-  val alu_out_tag_preserve = Cat(io.req.bits.rs1_data(63, 60), alu.io.out(59, 0))
   val alu_out = Mux(io.req.bits.uop.is_sfb_shadow && io.req.bits.pred_data,
     Mux(io.req.bits.uop.ldst_is_rs1, io.req.bits.rs1_data, io.req.bits.rs2_data),
     Mux(io.req.bits.uop.uopc === uopMOV, io.req.bits.rs2_data, 
-    Mux(io.req.bits.uop.uopc === uopMTE_ADD, alu_out_tag_preserve, alu.io.out)))
+    Mux(mteAddOnValid, mteAddOnOut, alu.io.out)))
   r_val (0) := io.req.valid
   r_data(0) := Mux(io.req.bits.uop.is_sfb_br, pc_sel === PC_BRJMP, alu_out)
   r_pred(0) := io.req.bits.uop.is_sfb_shadow && io.req.bits.pred_data
