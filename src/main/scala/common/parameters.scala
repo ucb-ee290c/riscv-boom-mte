@@ -98,6 +98,7 @@ case class BoomCoreParams(
   mcontextWidth: Int = 0,
   scontextWidth: Int = 0,
   useMTE: Boolean = false,
+  mteRegions:List[BoomMTERegion] = List(),
 
   /* debug stuff */
   enableCommitLogPrintf: Boolean = false,
@@ -140,7 +141,7 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   }
 
   /* xLen 1s, suitable for masking max size VAs */
-  private val xLenMask = BigInt((1 << xLen) - 1)
+  private val xLenMask = (BigInt(1) << xLen) - 1
   private def mteCSRGen(id: Int, mask: BigInt, init: BigInt, hasWritePort:Boolean = false): Option[CustomCSR] = {
     /* Don't generate MTE CSRs if we don't have MTE enabled for this core */
     if (useMTE) {
@@ -175,12 +176,12 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   def smte_tagSeedCSR : Option[CustomCSR] = 
     mteCSRGen(MTECSRs.smte_tag_seedID, xLenMask, 0)
 
-  def smte_tagbases : Seq[CustomCSR] = MTECSRs.smte_tagbaseIDs.flatMap {
+  def smte_tagbases : Seq[CustomCSR] = MTECSRs.smte_tagbaseIDs(mteRegions).flatMap {
     csr_id =>
     mteCSRGen(csr_id, xLenMask, 0)
   }
 
-  def smte_tagmasks : Seq[CustomCSR] = MTECSRs.smte_tagmaskIDs.flatMap {
+  def smte_tagmasks : Seq[CustomCSR] = MTECSRs.smte_tagmaskIDs(mteRegions).flatMap {
     csr_id =>
     mteCSRGen(csr_id, xLenMask, 0)
   }
@@ -316,6 +317,8 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val enableGHistStallRepair = boomParams.enableGHistStallRepair
   val enableBTBFastRepair = boomParams.enableBTBFastRepair
   val useMTE = boomParams.useMTE
+  val mteRegions = boomParams.mteRegions
+
 
   //************************************
   // Implicitly calculated constants
@@ -355,3 +358,9 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val corePAddrBits = paddrBits
   val corePgIdxBits = pgIdxBits
 }
+
+/// Defines a memory device/region which supports Memory Tagging
+case class BoomMTERegion(
+  base:BigInt,
+  size:BigInt
+)
