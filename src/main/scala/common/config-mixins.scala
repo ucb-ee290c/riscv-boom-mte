@@ -575,7 +575,8 @@ class WithNSmallMTEBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) exten
                   base = 0x80000000L,
                   size = 268435456
                 )
-              )
+              ),
+              enableMemtracePrintf = true
             ),
             dcache = Some(
               DCacheParams(rowBits = site(SystemBusKey).beatBits, nSets=64, nWays=4, nMSHRs=2, nTLBWays=8)

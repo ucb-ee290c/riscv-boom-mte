@@ -2,6 +2,10 @@ package boom.common
 import chisel3.util._
 import freechips.rocketchip.tile.CustomCSR
 
+object MTEConfig {
+    val tagBits:Int = 4
+}
+
 object MTEInstructions {
     /*
      * The custom-3 RISCV space uses opcode 1111011. We are free to dice it 
@@ -49,7 +53,7 @@ object MTECSRs {
 
     def smte_tagbaseIDs(mteRegions:List[BoomMTERegion]):Seq[Int] = {
         val regionCount = mteRegions.size
-        assert(regionCount <= mte_region_max, s"Too many MTE regions (requested=$regionCount, max=$mte_region_max)")
+        require(regionCount <= mte_region_max, s"Too many MTE regions (requested=$regionCount, max=$mte_region_max)")
         0.to(regionCount).map {
             i =>
             smte_tag_base_min_id + (2 * i)
@@ -58,7 +62,7 @@ object MTECSRs {
 
     def smte_tagmaskIDs(mteRegions:List[BoomMTERegion]):Seq[Int] = {
         val regionCount = mteRegions.size
-        assert(regionCount <= mte_region_max, s"Too many MTE regions (requested=$regionCount, max=$mte_region_max)")
+        require(regionCount <= mte_region_max, s"Too many MTE regions (requested=$regionCount, max=$mte_region_max)")
 
         0.to(regionCount).map {
             i =>
@@ -66,10 +70,13 @@ object MTECSRs {
         }
     }
 
+    def widthToMask(width:Int):BigInt = {
+        (BigInt(1) << width) - 1
+    }
     def smte_config_enableShift         =   0
-    def smte_config_enableMask          =   0x7
+    def smte_config_enableWidth         =   3
     def smte_config_enforceSyncShift    =   3
-    def smte_config_enforceSyncMask     =   0x7
+    def smte_config_enforceSyncWidth    =   3
     def smte_config_permissiveTagShift  =   6
-    def smte_config_permissiveTagMask   =   0xf
+    def smte_config_permissiveTagWidth  =   4
 }
