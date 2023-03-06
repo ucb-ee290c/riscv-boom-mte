@@ -127,6 +127,7 @@ int main(int argc, char** argv) {
     uint64_t addr = strtoul(line, &line, 16);
     uint64_t stdata = strtoul(line, &line, 16);
     uint64_t wbdata = strtoul(line, &line, 16);
+    uint64_t mte_tag = strtoul(line, &line, 16);
 
     //printf("%lu %d %d %lx %lx %lx\n", tsc, uopc, memsize, addr, stdata, wbdata);
 

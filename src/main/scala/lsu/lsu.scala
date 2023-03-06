@@ -172,6 +172,13 @@ class LDQEntry(implicit p: Parameters) extends BoomBundle()(p)
   val addr                = Valid(UInt(coreMaxAddrBits.W))
   val addr_is_virtual     = Bool() // Virtual address, we got a TLB miss
   val addr_is_uncacheable = Bool() // Uncacheable, wait until head of ROB to execute
+  val addr_mte_tag:Option[UInt] = {
+    if (useMTE) {
+      Some(UInt(MTEConfig.tagBits.W))
+    } else {
+      None
+    }
+  }
 
   val executed            = Bool() // load sent to memory, reset by NACKs
   val succeeded           = Bool()
@@ -192,6 +199,13 @@ class STQEntry(implicit p: Parameters) extends BoomBundle()(p)
 {
   val addr                = Valid(UInt(coreMaxAddrBits.W))
   val addr_is_virtual     = Bool() // Virtual address, we got a TLB miss
+  val addr_mte_tag:Option[UInt] = {
+    if (useMTE) {
+      Some(UInt(MTEConfig.tagBits.W))
+    } else {
+      None
+    }
+  }
   val data                = Valid(UInt(xLen.W))
 
   val committed           = Bool() // committed by ROB
@@ -612,6 +626,18 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                     Mux(will_fire_sta_retry     (w)  , stq_retry_e.bits.addr.bits,
                     Mux(will_fire_hella_incoming(w)  , hella_req.addr,
                                                        0.U))))))
+  val ldst_vaddr_mte_tag = widthMap(w => {
+    if (useMTE) {
+      Mux(will_fire_load_incoming (w) ||
+          will_fire_stad_incoming (w) ||
+          will_fire_sta_incoming  (w)  , exe_req(w).bits.mte_tag.get,
+      Mux(will_fire_load_retry    (w)  , ldq_retry_e.bits.addr_mte_tag.get,
+      Mux(will_fire_sta_retry     (w)  , stq_retry_e.bits.addr_mte_tag.get,
+                                         0.U)))
+    } else {
+      DontCare
+    }
+  })
 
   val exe_sfence = WireInit((0.U).asTypeOf(Valid(new rocket.SFenceReq)))
   for (w <- 0 until memWidth) {
@@ -839,6 +865,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       val ldq_idx = Mux(will_fire_load_incoming(w), ldq_incoming_idx(w), ldq_retry_idx)
       ldq(ldq_idx).bits.addr.valid          := true.B
       ldq(ldq_idx).bits.addr.bits           := Mux(exe_tlb_miss(w), exe_tlb_vaddr(w), exe_tlb_paddr(w))
+      if (useMTE) {
+        ldq(ldq_idx).bits.addr_mte_tag.get       := ldst_vaddr_mte_tag(w)
+      }
       ldq(ldq_idx).bits.uop.pdst            := exe_tlb_uop(w).pdst
       ldq(ldq_idx).bits.addr_is_virtual     := exe_tlb_miss(w)
       ldq(ldq_idx).bits.addr_is_uncacheable := exe_tlb_uncacheable(w) && !exe_tlb_miss(w)
@@ -854,6 +883,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
       stq(stq_idx).bits.addr.valid := !pf_st(w) // Prevent AMOs from executing!
       stq(stq_idx).bits.addr.bits  := Mux(exe_tlb_miss(w), exe_tlb_vaddr(w), exe_tlb_paddr(w))
+      if (useMTE) {
+        stq(stq_idx).bits.addr_mte_tag.get := ldst_vaddr_mte_tag(w)
+      }
       stq(stq_idx).bits.uop.pdst   := exe_tlb_uop(w).pdst // Needed for AMOs
       stq(stq_idx).bits.addr_is_virtual := exe_tlb_miss(w)
 
@@ -1476,8 +1508,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         val addr   = Mux(commit_store, stq(idx).bits.addr.bits, ldq(idx).bits.addr.bits)
         val stdata = Mux(commit_store, stq(idx).bits.data.bits, 0.U)
         val wbdata = Mux(commit_store, stq(idx).bits.debug_wb_data, ldq(idx).bits.debug_wb_data)
-        printf("MT %x %x %x %x %x %x %x\n",
-          io.core.tsc_reg, uop.uopc, uop.mem_cmd, uop.mem_size, addr, stdata, wbdata)
+        val addr_tag = Mux(commit_store, 
+                            stq(idx).bits.addr_mte_tag.getOrElse(0.U), 
+                            ldq(idx).bits.addr_mte_tag.getOrElse(0.U))
+        printf("MT %x %x %x %x %x %x %x %x\n",
+          io.core.tsc_reg, uop.uopc, uop.mem_cmd, uop.mem_size, addr, stdata, wbdata, addr_tag)
       }
     }
 

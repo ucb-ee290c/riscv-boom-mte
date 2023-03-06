@@ -152,12 +152,12 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   }
 
   def smte_configCSR: Option[CustomCSR] = {
-    val mask = BigInt(
-      MTECSRs.smte_config_enableMask << MTECSRs.smte_config_enableShift |
+    val mask = {
+      MTECSRs.widthToMask(MTECSRs.smte_config_enableWidth) << MTECSRs.smte_config_enableShift |
       //TODO: We don't currently support sync and we don't plan to. RAZ/WI
       // MTECSRs.smte_config_enforceSyncMask << MTECSRs.smte_config_enforceSyncShift |
-      MTECSRs.smte_config_permissiveTagMask << MTECSRs.smte_config_permissiveTagShift
-    )
+      MTECSRs.widthToMask(MTECSRs.smte_config_permissiveTagWidth) << MTECSRs.smte_config_permissiveTagShift
+    }
 
     val init = BigInt(
       0 << MTECSRs.smte_config_enableShift |
@@ -190,6 +190,12 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     smte_fpcCSR ++ smte_tagSeedCSR ++ smte_tagbases ++ smte_tagmasks
 
   def disableOOO = getOrElse(chickenCSR, _.value(3), true.B)
+
+  def mteEnabled = getOrElse(
+    smte_configCSR, 
+    _.value(MTECSRs.smte_config_enableShift + MTECSRs.smte_config_enableWidth - 1, MTECSRs.smte_config_enableShift), 
+    0.U
+  )
 
   // Returns the writable IO port for a CustomCSR definition if that CSR is both
   // enabled and writable in this configuration 
