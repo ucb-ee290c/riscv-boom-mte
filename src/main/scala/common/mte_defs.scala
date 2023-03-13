@@ -4,6 +4,8 @@ import freechips.rocketchip.tile.CustomCSR
 
 object MTEConfig {
     val tagBits:Int = 4
+    /** The number of bytes which a single tag covers */
+    val taggingGranuleBytes:Int = 16
 }
 
 object MTEInstructions {
@@ -54,7 +56,7 @@ object MTECSRs {
     def smte_tagbaseIDs(mteRegions:List[BoomMTERegion]):Seq[Int] = {
         val regionCount = mteRegions.size
         require(regionCount <= mte_region_max, s"Too many MTE regions (requested=$regionCount, max=$mte_region_max)")
-        0.to(regionCount).map {
+        0.until(regionCount).map {
             i =>
             smte_tag_base_min_id + (2 * i)
         }
@@ -64,7 +66,7 @@ object MTECSRs {
         val regionCount = mteRegions.size
         require(regionCount <= mte_region_max, s"Too many MTE regions (requested=$regionCount, max=$mte_region_max)")
 
-        0.to(regionCount).map {
+        0.until(regionCount).map {
             i =>
             smte_tag_base_min_id + (2 * i) + 1
         }

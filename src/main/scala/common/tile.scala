@@ -27,6 +27,8 @@ import boom.ifu._
 import boom.lsu._
 import boom.util.{BoomCoreStringPrefix}
 import freechips.rocketchip.prci.ClockSinkParameters
+import lsu.BoomNonBlockingTCacheModule
+import lsu.TCacheParams
 
 
 case class BoomTileAttachParams(
@@ -46,6 +48,7 @@ case class BoomTileParams(
   core: BoomCoreParams = BoomCoreParams(),
   icache: Option[ICacheParams] = Some(ICacheParams()),
   dcache: Option[DCacheParams] = Some(DCacheParams()),
+  tcache: Option[TCacheParams] = None,
   btb: Option[BTBParams] = Some(BTBParams()),
   name: Option[String] = Some("boom_tile"),
   hartId: Int = 0
@@ -131,7 +134,6 @@ class BoomTile private(
   val dCacheTap = TLIdentityNode()
   tlMasterXbar.node := dCacheTap := TLWidthWidget(tileParams.dcache.get.rowBits/8) := dcache.node
 
-
   // Frontend/ICache
   val frontend = LazyModule(new BoomFrontend(tileParams.icache.get, staticIdForMetadataUseOnly))
   frontend.resetVectorSinkNode := resetVectorNexusNode
@@ -155,6 +157,14 @@ class BoomTileModuleImp(outer: BoomTile) extends BaseTileModuleImp(outer){
   val core = Module(new BoomCore()(outer.p))
   val lsu  = Module(new LSU()(outer.p, outer.dcache.module.edge))
 
+  val tcache : Option[BoomNonBlockingTCacheModule] = {
+    if (outer.boomParams.core.useMTE) {
+      Some(Module(new BoomNonBlockingTCacheModule(outer.boomParams.tcache.get)(outer.p)))
+    } else {
+      None
+    }
+  }
+
   val ptwPorts         = ListBuffer(lsu.io.ptw, outer.frontend.module.io.ptw, core.io.ptw_tlb)
 
   val hellaCachePorts  = ListBuffer[HellaCacheIO]()
@@ -174,6 +184,10 @@ class BoomTileModuleImp(outer: BoomTile) extends BaseTileModuleImp(outer){
 
   //fpuOpt foreach { fpu => core.io.fpu <> fpu.io } RocketFpu - not needed in boom
   core.io.rocc := DontCare
+
+  if (outer.boomParams.core.useMTE) {
+    core.io.tcache <> tcache.get.io.core
+  }
   
   // PTW
   val ptw  = Module(new PTW(ptwPorts.length)(outer.dcache.node.edges.out(0), outer.p))
@@ -233,6 +247,9 @@ class BoomTileModuleImp(outer: BoomTile) extends BaseTileModuleImp(outer){
   hellaCacheArb.io.requestor <> hellaCachePorts.toSeq
   lsu.io.hellacache <> hellaCacheArb.io.mem
   outer.dcache.module.io.lsu <> lsu.io.dmem
+  if (outer.boomParams.core.useMTE) {
+    lsu.io.tcache.get <> tcache.get.io.lsu
+  }
 
   // Generate a descriptive string
   val frontendStr = outer.frontend.module.toString

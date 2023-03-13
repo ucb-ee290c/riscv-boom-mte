@@ -18,6 +18,7 @@ import freechips.rocketchip.tile._
 import boom.ifu._
 import boom.exu._
 import boom.lsu._
+import lsu.TCacheParams
 
 // ---------------------
 // BOOM Config Fragments
@@ -583,6 +584,14 @@ class WithNSmallMTEBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) exten
             ),
             icache = Some(
               ICacheParams(rowBits = site(SystemBusKey).beatBits, nSets=64, nWays=4, fetchBytes=2*4)
+            ),
+            tcache = Some (
+              TCacheParams(
+                nSets = 8,
+                nWays = 2,
+                blockSizeBytes = 8,
+                nMSHRs = 2
+              )
             ),
             hartId = i + idOffset
           ),

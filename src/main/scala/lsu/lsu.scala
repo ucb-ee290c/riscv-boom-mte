@@ -54,6 +54,7 @@ import freechips.rocketchip.util.Str
 import boom.common._
 import boom.exu.{BrUpdateInfo, Exception, FuncUnitResp, CommitSignals, ExeUnitResp}
 import boom.util.{BoolToChar, AgePriorityEncoder, IsKilledByBranch, GetNewBrMask, WrapInc, IsOlder, UpdateBrMask}
+import lsu.TCacheLSUIO
 
 class LSUExeIO(implicit p: Parameters) extends BoomBundle()(p)
 {
@@ -162,6 +163,13 @@ class LSUIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
   val ptw   = new rocket.TLBPTWIO
   val core  = new LSUCoreIO
   val dmem  = new LSUDMemIO
+  val tcache:Option[TCacheLSUIO] = {
+    if (useMTE) {
+      Some(Flipped(new TCacheLSUIO()(p=p, tcacheParams=boomTileParams.tcache.get)))
+    } else {
+      None
+    }
+  }
 
   val hellacache = Flipped(new freechips.rocketchip.rocket.HellaCacheIO)
 }
