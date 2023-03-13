@@ -142,6 +142,7 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
 
   /* xLen 1s, suitable for masking max size VAs */
   private val xLenMask = (BigInt(1) << xLen) - 1
+  private val physicalAddressMask = (BigInt(1) << coreMaxAddrBits) - 1
   private def mteCSRGen(id: Int, mask: BigInt, init: BigInt, hasWritePort:Boolean = false): Option[CustomCSR] = {
     /* Don't generate MTE CSRs if we don't have MTE enabled for this core */
     if (useMTE) {
@@ -176,26 +177,40 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   def smte_tagSeedCSR : Option[CustomCSR] = 
     mteCSRGen(MTECSRs.smte_tag_seedID, xLenMask, 0)
 
-  def smte_tagbases : Seq[CustomCSR] = MTECSRs.smte_tagbaseIDs(mteRegions).flatMap {
+  def smte_tagbaseCSRs : Seq[CustomCSR] = MTECSRs.smte_tagbaseIDs(mteRegions).flatMap {
     csr_id =>
-    mteCSRGen(csr_id, xLenMask, 0)
+    mteCSRGen(csr_id, physicalAddressMask, 0)
   }
 
-  def smte_tagmasks : Seq[CustomCSR] = MTECSRs.smte_tagmaskIDs(mteRegions).flatMap {
+  def smte_tagmaskCSRs : Seq[CustomCSR] = MTECSRs.smte_tagmaskIDs(mteRegions).flatMap {
     csr_id =>
-    mteCSRGen(csr_id, xLenMask, 0)
+    mteCSRGen(csr_id, physicalAddressMask, 0)
   }
 
   override def decls = super.decls ++ smte_configCSR ++ smte_faCSR ++ 
-    smte_fpcCSR ++ smte_tagSeedCSR ++ smte_tagbases ++ smte_tagmasks
+    smte_fpcCSR ++ smte_tagSeedCSR ++ smte_tagbaseCSRs ++ smte_tagmaskCSRs
 
   def disableOOO = getOrElse(chickenCSR, _.value(3), true.B)
 
   def mteEnabled = getOrElse(
     smte_configCSR, 
     _.value(MTECSRs.smte_config_enableShift + MTECSRs.smte_config_enableWidth - 1, MTECSRs.smte_config_enableShift), 
-    0.U
+    DontCare
   )
+
+  def mtePermissiveTag = getOrElse(
+    smte_configCSR,
+    _.value(MTECSRs.smte_config_permissiveTagShift + MTECSRs.smte_config_permissiveTagWidth - 1, MTECSRs.smte_config_permissiveTagShift),
+    DontCare
+  )
+
+  def smte_tagbases = smte_tagbaseCSRs.map { csr =>
+    getOrElse(Some(csr), _.value(coreMaxAddrBits - 1, 0), DontCare)
+  }
+
+  def smte_tagmasks = smte_tagmaskCSRs.map { csr =>
+    getOrElse(Some(csr), _.value(coreMaxAddrBits - 1, 0), DontCare)
+  }
 
   // Returns the writable IO port for a CustomCSR definition if that CSR is both
   // enabled and writable in this configuration 
@@ -218,6 +233,7 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
 trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
 {
   val boomParams: BoomCoreParams = tileParams.core.asInstanceOf[BoomCoreParams]
+  val boomTileParams: BoomTileParams = tileParams.asInstanceOf[BoomTileParams]
 
   //************************************
   // Superscalar Widths

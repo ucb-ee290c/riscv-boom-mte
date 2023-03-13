@@ -46,6 +46,7 @@ import boom.common._
 import boom.ifu.{GlobalHistory, HasBoomFrontendParameters}
 import boom.exu.FUConstants._
 import boom.util._
+import lsu.TCacheCoreIO
 
 /**
  * Top level core object that connects the Frontend to the rest of the pipeline.
@@ -64,6 +65,7 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
     val ptw_tlb = new freechips.rocketchip.rocket.TLBPTWIO()
     val trace = Output(Vec(coreParams.retireWidth, new ExtendedTracedInstruction))
     val fcsr_rm = UInt(freechips.rocketchip.tile.FPConstants.RM_SZ.W)
+    val tcache = Flipped(new TCacheCoreIO)
   }
   //**********************************
   // construct all of the modules
@@ -282,6 +284,12 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
     val fpcCSR = custom_csrs.getWritableOpt(custom_csrs.smte_fpcCSR).get
     fpcCSR.wport_wen := false.B
     fpcCSR.wport_wdata := DontCare  
+
+    /* Pass the region configuration */
+    
+    io.tcache.mteRegionBases := VecInit(custom_csrs.smte_tagbases)
+    io.tcache.mteRegionMasks := VecInit(custom_csrs.smte_tagmasks)
+    io.tcache.mtePermissiveTag := custom_csrs.mtePermissiveTag
   }
 
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
