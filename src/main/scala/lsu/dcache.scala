@@ -411,6 +411,24 @@ class BoomDCacheBundle(implicit p: Parameters, edge: TLEdgeOut) extends BoomBund
   val lsu   = Flipped(new LSUDMemIO)
 }
 
+// class BoomL1DMetadata(implicit p: Parameters) extends L1Metadata {
+//   val mte_tags_coh:Option[ClientMetadata] = {
+//     if (useMTE) {
+//       Some(new ClientMetadata)
+//     } else {
+//       None
+//     }
+//   }
+
+//   val mte_tags:Option[UInt] = {
+//     if (useMTE) {
+//       require()
+//     } else {
+//       None
+//     }
+//   }
+// }
+
 class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModuleImp(outer)
   with HasL1HellaCacheParameters
   with HasBoomCoreParameters
