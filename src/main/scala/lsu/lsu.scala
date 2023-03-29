@@ -49,12 +49,13 @@ import chisel3.util._
 import freechips.rocketchip.config.Parameters
 import freechips.rocketchip.rocket
 import freechips.rocketchip.tilelink._
-import freechips.rocketchip.util.Str
+import freechips.rocketchip.util.{Str, BooleanToAugmentedBoolean}
 
 import boom.common._
 import boom.exu.{BrUpdateInfo, Exception, FuncUnitResp, CommitSignals, ExeUnitResp}
 import boom.util.{BoolToChar, AgePriorityEncoder, IsKilledByBranch, GetNewBrMask, WrapInc, IsOlder, UpdateBrMask}
 import lsu.TCacheLSUIO
+import lsu.TCacheRequestTypeEnum
 
 class LSUExeIO(implicit p: Parameters) extends BoomBundle()(p)
 {
@@ -71,6 +72,8 @@ class BoomDCacheReq(implicit p: Parameters) extends BoomBundle()(p)
   val addr  = UInt(coreMaxAddrBits.W)
   val data  = Bits(coreDataBits.W)
   val is_hella = Bool() // Is this the hellacache req? If so this is not tracked in LDQ or STQ
+  // val is_tcache = useMTE.option(Bool()) // Is this a request originating from the tag cache?
+  // val byte_wmask = useMTE.option(Bits(8.W)) // MTE requires sub-byte writes to dcache for tags
 }
 
 class BoomDCacheResp(implicit p: Parameters) extends BoomBundle()(p)
@@ -78,6 +81,7 @@ class BoomDCacheResp(implicit p: Parameters) extends BoomBundle()(p)
 {
   val data = Bits(coreDataBits.W)
   val is_hella = Bool()
+  // val is_tcache = useMTE.option(Bool()) // Is this a request originating from the tag cache?
 }
 
 class LSUDMemIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
@@ -180,16 +184,27 @@ class LDQEntry(implicit p: Parameters) extends BoomBundle()(p)
   val addr                = Valid(UInt(coreMaxAddrBits.W))
   val addr_is_virtual     = Bool() // Virtual address, we got a TLB miss
   val addr_is_uncacheable = Bool() // Uncacheable, wait until head of ROB to execute
-  val addr_mte_tag:Option[UInt] = {
-    if (useMTE) {
-      Some(UInt(MTEConfig.tagBits.W))
-    } else {
-      None
-    }
-  }
+  val addr_mte_tag        = useMTE.option(UInt(MTEConfig.tagBits.W)) // tag from address
+  val phys_mte_tag        = useMTE.option(Valid(UInt(MTEConfig.tagBits.W))) // the memory's actual tag
 
   val executed            = Bool() // load sent to memory, reset by NACKs
+  /**
+   * Have the tag check requests been launched into the tag cache?
+   * Note that this does not imply that tags have yet arrived, see the valid bit
+   * on the phys_mte_tag.
+   */
+  val phys_mte_tag_executed = useMTE.option(Bool()) //tag fetch sent to memory
+  /**
+    * Data has been received from dmem and transmitted back to the core
+    * (i.e. this load has been released)
+    */
   val succeeded           = Bool()
+  /**
+   * The core has committed this instruction. This doesn't necessarily mean
+   * we're done with the entry as we still need to wait for both data and tag
+   * check
+   */
+  val committed           = Bool()
   val order_fail          = Bool()
   val observed            = Bool()
 
@@ -207,16 +222,12 @@ class STQEntry(implicit p: Parameters) extends BoomBundle()(p)
 {
   val addr                = Valid(UInt(coreMaxAddrBits.W))
   val addr_is_virtual     = Bool() // Virtual address, we got a TLB miss
-  val addr_mte_tag:Option[UInt] = {
-    if (useMTE) {
-      Some(UInt(MTEConfig.tagBits.W))
-    } else {
-      None
-    }
-  }
+  val addr_mte_tag        = useMTE.option(UInt(MTEConfig.tagBits.W)) // tag from address
+  val phys_mte_tag        = useMTE.option(Valid(UInt(MTEConfig.tagBits.W))) // the memory's actual tag
   val data                = Valid(UInt(xLen.W))
 
   val committed           = Bool() // committed by ROB
+  val phys_mte_tag_executed = useMTE.option(Bool()) //tag fetch sent to memory
   val succeeded           = Bool() // D$ has ack'd this, we don't need to maintain this anymore
 
   val debug_wb_data       = UInt(xLen.W)
@@ -390,18 +401,20 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // First we determine what operations are waiting to execute.
   // These are the "can_fire"/"will_fire" signals
 
-  val will_fire_load_incoming  = Wire(Vec(memWidth, Bool()))
-  val will_fire_stad_incoming  = Wire(Vec(memWidth, Bool()))
-  val will_fire_sta_incoming   = Wire(Vec(memWidth, Bool()))
-  val will_fire_std_incoming   = Wire(Vec(memWidth, Bool()))
-  val will_fire_sfence         = Wire(Vec(memWidth, Bool()))
-  val will_fire_hella_incoming = Wire(Vec(memWidth, Bool()))
-  val will_fire_hella_wakeup   = Wire(Vec(memWidth, Bool()))
-  val will_fire_release        = Wire(Vec(memWidth, Bool()))
-  val will_fire_load_retry     = Wire(Vec(memWidth, Bool()))
-  val will_fire_sta_retry      = Wire(Vec(memWidth, Bool()))
-  val will_fire_store_commit   = Wire(Vec(memWidth, Bool()))
-  val will_fire_load_wakeup    = Wire(Vec(memWidth, Bool()))
+  val will_fire_load_incoming      = Wire(Vec(memWidth, Bool()))
+  val will_fire_stad_incoming      = Wire(Vec(memWidth, Bool()))
+  val will_fire_sta_incoming       = Wire(Vec(memWidth, Bool()))
+  val will_fire_std_incoming       = Wire(Vec(memWidth, Bool()))
+  val will_fire_sfence             = Wire(Vec(memWidth, Bool()))
+  val will_fire_hella_incoming     = Wire(Vec(memWidth, Bool()))
+  val will_fire_hella_wakeup       = Wire(Vec(memWidth, Bool()))
+  val will_fire_release            = Wire(Vec(memWidth, Bool()))
+  val will_fire_load_retry         = Wire(Vec(memWidth, Bool()))
+  val will_fire_sta_retry          = Wire(Vec(memWidth, Bool()))
+  val will_fire_store_commit       = Wire(Vec(memWidth, Bool()))
+  val will_fire_load_wakeup        = Wire(Vec(memWidth, Bool()))
+  val will_fire_ldq_tag_retry      = Wire(Vec(memWidth, Bool()))
+  val will_fire_stq_tag_retry      = Wire(Vec(memWidth, Bool()))
 
   val exe_req = WireInit(VecInit(io.core.exe.map(_.req)))
   // Sfence goes through all pipes
@@ -455,6 +468,50 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     e.addr.valid && !e.executed && !e.succeeded && !e.addr_is_virtual && !block
   }), ldq_head))
   val ldq_wakeup_e   = ldq(ldq_wakeup_idx)
+
+  def ldq_e_can_tag_retry(e:LDQEntry) = {
+    if (!useMTE) {
+      false.B
+    } else {
+      /*
+      Allow launch of valid entries if they've completed TLB and don't have a tag already.
+      While there is a possibility that an entry may be ineligible for ldq_retry but could
+      fetch tags if we allowed virtual here and did TLB, this should happen fairly rarely
+      since this only happens if we only have blocked loads in the queue.
+      TODO: Track this as a metric--is this actually true?
+      */
+      e.addr.valid && !e.addr_is_virtual && 
+        !e.phys_mte_tag_executed.get && !e.phys_mte_tag.get.valid
+    }
+  }
+
+  // If the tag cache is blocked due to too many outstanding misses, tag operations
+  // will be retried as soon as available
+  val ldq_tag_retry_idx = RegNext(AgePriorityEncoder((0.until(numLdqEntries)).map(i => {
+    val e = ldq(i).bits
+    ldq_e_can_tag_retry(e)
+  }), ldq_head))
+  val ldq_tag_retry_e = ldq(ldq_tag_retry_idx)
+
+  def stq_e_can_tag_retry(e:STQEntry) = {
+    if (!useMTE) {
+      false.B
+    } else {
+      /*
+      Allow launch of valid entries if they've completed TLB and don't have a tag already.
+      */
+      e.addr.valid && !e.addr_is_virtual && 
+        !e.phys_mte_tag_executed.get && !e.phys_mte_tag.get.valid
+    }
+  }
+
+  // If the tag cache is blocked due to too many outstanding misses, tag operations
+  // will be retried as soon as availale
+  val stq_tag_retry_idx = RegNext(AgePriorityEncoder((0.until(numStqEntries)).map(i => {
+    val e = stq(i).bits
+    stq_e_can_tag_retry(e)
+  }), stq_head))
+  val stq_tag_retry_e = stq(stq_tag_retry_idx)
 
   // -----------------------
   // Determine what can fire
@@ -541,6 +598,24 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   // Can we fire a hellacache request that the dcache nack'd
   val can_fire_hella_wakeup    = WireInit(widthMap(w => false.B)) // This is assigned to in the hellashim controller
+  val can_fire_ldq_tag_retry = widthMap(w =>
+     //XXX: Won't this tell ever lane they can fire this? Not an issue for our 1-wide requirement but it's unclear
+     //who is responsible for making sure an op fires down only one lane at a time
+     ldq_tag_retry_e.valid && ldq_e_can_tag_retry(ldq_tag_retry_e.bits)
+  )
+  val can_fire_stq_tag_retry = widthMap(w =>
+    //XXX: ibd
+    stq_tag_retry_e.valid && stq_e_can_tag_retry(stq_tag_retry_e.bits)
+  )
+
+  // val can_fire_tcache_ld_incoming = WireInit(widthMap(w => 
+  //   if (!useMte) {
+  //     false.B
+  //   } else {
+  //     //XXX: tcache is width 1 only
+  //     io.tcache.get.nlc_req.valid && io.tcache.get.nlc_req.bits.uop.is
+  //   }  
+  // ))
 
   //---------------------------------------------------------
   // Controller logic. Arbitrate which request actually fires
@@ -551,16 +626,19 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     var dc_avail   = true.B
     var lcam_avail = true.B
     var rob_avail  = true.B
+    var tcache_avil= true.B
 
-    def lsu_sched(can_fire: Bool, uses_tlb:Boolean, uses_dc:Boolean, uses_lcam: Boolean, uses_rob:Boolean): Bool = {
+    def lsu_sched(can_fire: Bool, uses_tlb:Boolean, uses_dc:Boolean, uses_lcam: Boolean, uses_rob:Boolean, uses_tcache:Boolean): Bool = {
       val will_fire = can_fire && !(uses_tlb.B && !tlb_avail) &&
                                   !(uses_lcam.B && !lcam_avail) &&
                                   !(uses_dc.B && !dc_avail) &&
-                                  !(uses_rob.B && !rob_avail)
+                                  !(uses_rob.B && !rob_avail) &&
+                                  !((useMTE.B && uses_tcache.B && !tcache_avil))
       tlb_avail  = tlb_avail  && !(will_fire && uses_tlb.B)
       lcam_avail = lcam_avail && !(will_fire && uses_lcam.B)
       dc_avail   = dc_avail   && !(will_fire && uses_dc.B)
       rob_avail  = rob_avail  && !(will_fire && uses_rob.B)
+      tcache_avil= tcache_avil && !(will_fire && uses_tcache.B)
       dontTouch(will_fire) // dontTouch these so we can inspect the will_fire signals
       will_fire
     }
@@ -572,18 +650,26 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     // Notes on performance
     //  - Prioritize releases, this speeds up cache line writebacks and refills
     //  - Store commits are lowest priority, since they don't "block" younger instructions unless stq fills up
-    will_fire_load_incoming (w) := lsu_sched(can_fire_load_incoming (w) , true , true , true , false) // TLB , DC , LCAM
-    will_fire_stad_incoming (w) := lsu_sched(can_fire_stad_incoming (w) , true , false, true , true)  // TLB ,    , LCAM , ROB
-    will_fire_sta_incoming  (w) := lsu_sched(can_fire_sta_incoming  (w) , true , false, true , true)  // TLB ,    , LCAM , ROB
-    will_fire_std_incoming  (w) := lsu_sched(can_fire_std_incoming  (w) , false, false, false, true)  //                 , ROB
-    will_fire_sfence        (w) := lsu_sched(can_fire_sfence        (w) , true , false, false, true)  // TLB ,    ,      , ROB
-    will_fire_release       (w) := lsu_sched(can_fire_release       (w) , false, false, true , false) //            LCAM
-    will_fire_hella_incoming(w) := lsu_sched(can_fire_hella_incoming(w) , true , true , false, false) // TLB , DC
-    will_fire_hella_wakeup  (w) := lsu_sched(can_fire_hella_wakeup  (w) , false, true , false, false) //     , DC
-    will_fire_load_retry    (w) := lsu_sched(can_fire_load_retry    (w) , true , true , true , false) // TLB , DC , LCAM
-    will_fire_sta_retry     (w) := lsu_sched(can_fire_sta_retry     (w) , true , false, true , true)  // TLB ,    , LCAM , ROB // TODO: This should be higher priority
-    will_fire_load_wakeup   (w) := lsu_sched(can_fire_load_wakeup   (w) , false, true , true , false) //     , DC , LCAM1
-    will_fire_store_commit  (w) := lsu_sched(can_fire_store_commit  (w) , false, true , false, false) //     , DC
+    //  - Tag retries are low priority as they don't block unless the queue/ROB is full
+    will_fire_load_incoming (w) := lsu_sched(can_fire_load_incoming (w) , true , true , true , false, true)  // TLB , DC , LCAM ,     , TCACHE
+    will_fire_stad_incoming (w) := lsu_sched(can_fire_stad_incoming (w) , true , false, true , true,  true)  // TLB ,    , LCAM , ROB , TCACHE
+    will_fire_sta_incoming  (w) := lsu_sched(can_fire_sta_incoming  (w) , true , false, true , true,  true)  // TLB ,    , LCAM , ROB , TCACHE
+    will_fire_std_incoming  (w) := lsu_sched(can_fire_std_incoming  (w) , false, false, false, true,  false) //                 , ROB
+    will_fire_sfence        (w) := lsu_sched(can_fire_sfence        (w) , true , false, false, true,  false) // TLB ,    ,      , ROB
+    will_fire_release       (w) := lsu_sched(can_fire_release       (w) , false, false, true , false, false) //            LCAM
+    will_fire_hella_incoming(w) := lsu_sched(can_fire_hella_incoming(w) , true , true , false, false, false) // TLB , DC
+    will_fire_hella_wakeup  (w) := lsu_sched(can_fire_hella_wakeup  (w) , false, true , false, false, false) //     , DC
+    will_fire_load_retry    (w) := lsu_sched(can_fire_load_retry    (w) , true , true , true , false, true)  // TLB , DC , LCAM  ,    , TCACHE
+    will_fire_sta_retry     (w) := lsu_sched(can_fire_sta_retry     (w) , true , false, true , true,  true)  // TLB ,    , LCAM , ROB , TCACHE// TODO: This should be higher priority
+    if (useMTE) {
+    will_fire_ldq_tag_retry (w) := lsu_sched(can_fire_ldq_tag_retry (w) , false, false, false, false, true)  //     ,    ,      ,    ,  TCACHE
+    will_fire_stq_tag_retry (w) := lsu_sched(can_fire_stq_tag_retry (w) , false, false, false, false, true)  //     ,    ,      ,    ,  TCACHE
+    } else {
+      will_fire_ldq_tag_retry (w) := false.B
+      will_fire_stq_tag_retry (w) := false.B
+    }
+    will_fire_load_wakeup   (w) := lsu_sched(can_fire_load_wakeup   (w) , false, true , true , false, false) //     , DC , LCAM1
+    will_fire_store_commit  (w) := lsu_sched(can_fire_store_commit  (w) , false, true , false, false, false) //     , DC
 
 
     assert(!(exe_req(w).valid && !(will_fire_load_incoming(w) || will_fire_stad_incoming(w) || will_fire_sta_incoming(w) || will_fire_std_incoming(w) || will_fire_sfence(w))))
@@ -767,6 +853,148 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   }
 
 
+  //--------------------------------------------
+  // Tag Cache Access
+  // Launch requests into the tag cache
+  val tcache_addr = widthMap(w =>
+                    /* Tag retries already cleared TLB */
+                    Mux(will_fire_ldq_tag_retry (w)  , ldq_tag_retry_e.bits.addr,
+                    Mux(will_fire_stq_tag_retry (w)  , stq_tag_retry_e.bits.addr,
+                    {
+                      /* all others still need to clear TLB, so grab from there */
+                      val v = Wire(Valid(UInt(coreMaxAddrBits.W)))
+                      v.valid := !exe_tlb_miss(w)
+                      v.bits := exe_tlb_paddr(w)
+                      v
+                    })))
+
+  val tcache_will_fire = widthMap(w =>
+    will_fire_load_incoming (w) ||
+    will_fire_stad_incoming (w) ||
+    will_fire_sta_incoming  (w) ||
+    will_fire_load_retry    (w) ||
+    will_fire_sta_retry     (w) ||
+    will_fire_ldq_tag_retry (w) ||
+    will_fire_stq_tag_retry (w)
+  )
+
+  val tcache_ldq_e = widthMap(w =>
+                    Mux(will_fire_load_incoming (w)  , ldq_incoming_e(w),
+                    Mux(will_fire_load_retry    (w)  , ldq_retry_e,
+                    Mux(will_fire_ldq_tag_retry (w)  , ldq_tag_retry_e,
+                    {
+                      val v = Wire(Valid(new LDQEntry))
+                      v.valid := false.B
+                      v.bits := DontCare
+                      v
+                    }
+  ))))
+
+  val tcache_stq_e = widthMap(w =>
+                    Mux(will_fire_stad_incoming (w) ||
+                        will_fire_sta_incoming  (w)  , stq_incoming_e(w),
+                    Mux(will_fire_sta_retry     (w)  , stq_retry_e,
+                    Mux(will_fire_stq_tag_retry (w)  , stq_tag_retry_e,
+                    {
+                      val v = Wire(Valid(new STQEntry))
+                      v.valid := false.B
+                      v.bits := DontCare
+                      v
+                    }
+  ))))
+
+  val tcache_uop = widthMap({w =>
+    Mux(tcache_ldq_e(w).valid, tcache_ldq_e(w).bits.uop, tcache_stq_e(w).bits.uop)
+  })
+
+  val tcache_is_incoming = widthMap(w =>
+		       will_fire_load_incoming (w) ||
+                       will_fire_stad_incoming (w) ||
+                       will_fire_sta_incoming  (w))
+
+  if (useMTE) {
+    require(memWidth == 1, "Tag cacte does not support width > 1")
+    val tcacheIO = io.tcache.get
+    for (w <- 0 until memWidth) {
+      val req = tcacheIO.req
+      val reqB = req.bits
+      when (tcache_will_fire(w)) {
+        printf("A %d, B %d, C %d, D %d, E %d, F %d, G %d\n", 
+            will_fire_load_incoming (w),
+            will_fire_stad_incoming (w),
+            will_fire_sta_incoming  (w),
+            will_fire_load_retry    (w),
+            will_fire_sta_retry     (w),
+            will_fire_ldq_tag_retry (w),
+            will_fire_stq_tag_retry (w)
+        )
+        assert((tcache_stq_e(w).valid || tcache_ldq_e(w).valid), 
+          "No valid LDQ or STQ entry but we're firing on TCache?")
+        assert(((tcache_stq_e(w).valid && !tcache_ldq_e(w).valid) ||
+            (!tcache_stq_e(w).valid && tcache_ldq_e(w).valid)),
+          "Firing TCache with both LDQ and STQ valid")
+
+        /*
+        We can only actually fire the request if the tcache is ready (i.e. not
+        maxed on misses) and if the address translation completed (either due to
+        a TLB hit this cycle or from a previous if this is a retry)
+        */
+        val can_fire = req.ready && tcache_addr(w).valid
+        reqB.uop := tcache_uop(w)
+
+        //TODO: Support tag writes
+        reqB.requestType := TCacheRequestTypeEnum.READ
+        reqB.address := tcache_addr(w).bits
+        reqB.data := DontCare
+
+        /* If we're good to go, launch it! */
+        req.valid := can_fire
+        when (tcache_ldq_e(w).valid) {
+	  val e = ldq(tcache_uop(w).ldq_idx)
+          assert(tcache_is_incoming(w) || !/*tcache_ldq_e(w)*/e.bits.phys_mte_tag_executed.get, "Already executed?")
+	  printf("[lsu] can_fire=%d, ldq=%d\n", can_fire, tcache_uop(w).ldq_idx)
+          /*tcache_ldq_e(w)*/e.bits.phys_mte_tag_executed.get := can_fire
+        }.elsewhen(tcache_stq_e(w).valid) {
+	  val e = stq(tcache_uop(w).stq_idx)
+          assert(tcache_is_incoming(w) || !/*tcache_stq_e(w)*/e.bits.phys_mte_tag_executed.get, "Already executed?")
+	  printf("[lsu] can_fire=%d, stq=%d\n", can_fire, tcache_uop(w).stq_idx)
+          /*tcache_stq_e(w)*/e.bits.phys_mte_tag_executed.get := can_fire
+        } /* otherwise should be unreachable, already asserted above */
+      }.otherwise {
+        req.valid := false.B
+        reqB := DontCare
+      }
+    }
+
+
+    /* Handle tcache responses */
+    val resp = tcacheIO.resp
+    val respB = tcacheIO.resp.bits
+    when (resp.valid) {
+	printf("[lsu] ldq=%d, stq=%d\n", respB.uop.ldq_idx, respB.uop.stq_idx)
+      when (respB.uop.uses_ldq) {
+        val ldq_e = ldq(respB.uop.ldq_idx)
+        assert(ldq_e.valid, "TCache response for invalid/freed entry")
+        assert(ldq_e.bits.phys_mte_tag_executed.get, "TCache response for non-executed entry")
+        assert(!ldq_e.bits.phys_mte_tag.get.valid, "TCache response attempting to overwrite valid tag")
+        val tag = ldq_e.bits.phys_mte_tag.get
+        tag.valid := true.B
+        tag.bits := respB.data
+      }.elsewhen(respB.uop.uses_stq) {
+        val stq_e = stq(respB.uop.stq_idx)
+        assert(stq_e.valid, "TCache response for invalid/freed entry")
+        assert(stq_e.bits.phys_mte_tag_executed.get, "TCache response for non-executed entry")
+        assert(!stq_e.bits.phys_mte_tag.get.valid, "TCache response attempting to overwrite valid tag")
+
+        val tag = stq_e.bits.phys_mte_tag.get
+        tag.valid := true.B
+        tag.bits := respB.data
+      }.otherwise {
+        assert(false.B, "TCache should not issue LSU responses for untracked uops")
+      }
+    }
+  }
+
 
   //------------------------------
   // Issue Someting to Memory
@@ -796,6 +1024,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     dmem_req(w).bits.addr  := 0.U
     dmem_req(w).bits.data  := 0.U
     dmem_req(w).bits.is_hella := false.B
+    // if (useMTE) {
+    //   dmem_req(w).bits.is_tcache.get := false.B
+    // }
 
     io.dmem.s1_kill(w) := false.B
 
@@ -875,6 +1106,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq(ldq_idx).bits.addr.bits           := Mux(exe_tlb_miss(w), exe_tlb_vaddr(w), exe_tlb_paddr(w))
       if (useMTE) {
         ldq(ldq_idx).bits.addr_mte_tag.get       := ldst_vaddr_mte_tag(w)
+        val phys_mte_tag = ldq(ldq_idx).bits.phys_mte_tag.get
+        phys_mte_tag.valid := false.B
+        phys_mte_tag.bits := DontCare
       }
       ldq(ldq_idx).bits.uop.pdst            := exe_tlb_uop(w).pdst
       ldq(ldq_idx).bits.addr_is_virtual     := exe_tlb_miss(w)
@@ -893,6 +1127,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       stq(stq_idx).bits.addr.bits  := Mux(exe_tlb_miss(w), exe_tlb_vaddr(w), exe_tlb_paddr(w))
       if (useMTE) {
         stq(stq_idx).bits.addr_mte_tag.get := ldst_vaddr_mte_tag(w)
+        val phys_mte_tag = stq(stq_idx).bits.phys_mte_tag.get
+        phys_mte_tag.valid := false.B
+        phys_mte_tag.bits := DontCare
       }
       stq(stq_idx).bits.uop.pdst   := exe_tlb_uop(w).pdst // Needed for AMOs
       stq(stq_idx).bits.addr_is_virtual := exe_tlb_miss(w)
@@ -1500,6 +1737,12 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       assert (ldq(idx).valid, "[lsu] trying to commit an un-allocated load entry.")
       assert ((ldq(idx).bits.executed || ldq(idx).bits.forward_std_val) && ldq(idx).bits.succeeded ,
         "[lsu] trying to commit an un-executed load entry.")
+      if (useMTE) {
+        assert (
+          ldq(idx).bits.phys_mte_tag_executed.get, 
+          "[lsu] trying to commit load before tags have arrived."
+        )
+      }
 
       ldq(idx).valid                 := false.B
       ldq(idx).bits.addr.valid       := false.B
@@ -1548,6 +1791,12 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   when (clear_store)
   {
+  if (useMTE) {
+      assert (
+        stq(stq_head).bits.phys_mte_tag_executed.get, 
+        "[lsu] trying to clear store before tags have arrived."
+      )
+    }
     stq(stq_head).valid           := false.B
     stq(stq_head).bits.addr.valid := false.B
     stq(stq_head).bits.data.valid := false.B

@@ -192,6 +192,7 @@ class BoomTileModuleImp(outer: BoomTile) extends BaseTileModuleImp(outer){
 
   if (outer.boomParams.core.useMTE) {
     core.io.tcache <> tcache.get.io.core
+    hellaCachePorts ++= tcache.get.io.mem
   }
   
   // PTW
