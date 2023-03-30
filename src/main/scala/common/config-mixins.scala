@@ -568,6 +568,7 @@ class WithNSmallMTEBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) exten
               ftq = FtqParameters(nEntries=16),
               nPerfCounters = 2,
               fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true)),
+              enableCommitLogPrintf = true,
               useMTE = true,
               mteRegions = List(
                 /* Region 0 = default DRAM */

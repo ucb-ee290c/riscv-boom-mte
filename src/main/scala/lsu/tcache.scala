@@ -95,25 +95,29 @@ class NormalPhysicalAddress(implicit p: Parameters, tcacheParams: TCacheParams)
         val granuleAlignedAddress = address >> log2Ceil(MTEConfig.taggingGranuleBytes)
         tspa.bits.blockOffset := granuleAlignedAddress(mteTagsPerBlockBits - 1, 0)
         
-        val enclosingRegionMap = VecInit(mteRegions.map {region =>
-            address >= region.base.U && address < (region.base + region.size).U
-        })
-        /* 
-        We're valid if we have one hit. It's a SoC design error to build 
-        something with overlapping regions so we're also for sure 1H
-        */
-        tspa.valid := enclosingRegionMap.reduce( _ || _ )
-
         val regionPack = mteRegions zip (context.mteRegionBases zip context.mteRegionMasks)
         val tagStorageAddress = Mux1H(regionPack.map {case (region, (storageBase, storageMask)) =>
-            val inBounds = address >= region.base.U && address < (region.base + region.size).U
             val regionOffset = granuleAlignedAddress - (region.base >> log2Ceil(MTEConfig.taggingGranuleBytes)).U
-            
-            val storageAddress = (storageBase + regionOffset) & storageMask
-            inBounds -> storageAddress
+            val storageAddress = storageBase + regionOffset
+	    val storageAddressMasked = storageAddress & storageMask  
+	    /* Is the target address contained by the region? */
+            val inBounds = address >= region.base.U && address < (region.base + region.size).U && 
+		/* Is the storage address in bounds? */
+		storageAddress === storageAddressMasked &&
+		/* Is the storage mask non-zero? A zero mask indicates a tagging is disabled for the region */
+		storageMask =/= 0.U
+	    val v = Wire(Valid(UInt(coreMaxAddrBits.W)))
+	    v.valid := inBounds
+	    v.bits := storageAddress
+            inBounds -> v
         })
 
-        tspa.bits.address := tagStorageAddress
+        /* 
+        We're valid if we have a valid hit. It's a SoC design error to build 
+        something with overlapping regions so we're also for sure 1H
+        */
+        tspa.valid := tagStorageAddress.valid 
+        tspa.bits.address := tagStorageAddress.bits
 
         tspa
     }
@@ -392,7 +396,7 @@ class BoomNonBlockingTCacheModule(
             we launched a request for a region not covered by MTE. In this case,
             we simply return the permissive tag
             */
-	    printf("[tache] resp default = ldq=%d, stq=%d\n", s2_op.bits.uop.uses_ldq, s2_op.bits.uop.uses_stq) 
+	        printf("[tache] resp default = uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d\n", s2_op.bits.uop.uses_ldq, s2_op.bits.uop.ldq_idx, s2_op.bits.uop.uses_stq, s2_op.bits.uop.stq_idx) 
             resp.valid := true.B
             resp.bits.data := io.core.mtePermissiveTag
         } .otherwise {
@@ -403,6 +407,7 @@ class BoomNonBlockingTCacheModule(
             */
             resp.valid := s2_hit
             resp.bits.data := s2_data_read_value(s2_op.bits.address.bits.blockOffset)
+            assert(false.B, "not impl")
         }
     } .otherwise {
     	assert(false.B, "TCache unexpected s2_op type")
