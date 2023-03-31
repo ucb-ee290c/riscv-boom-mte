@@ -290,6 +290,8 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
     io.tcache.mteRegionBases := VecInit(custom_csrs.smte_tagbases)
     io.tcache.mteRegionMasks := VecInit(custom_csrs.smte_tagmasks)
     io.tcache.mtePermissiveTag := custom_csrs.mtePermissiveTag
+    io.tcache.brupdate := brupdate
+    io.tcache.exception := RegNext(rob.io.flush.valid) /* mirrors LSU */
   }
 
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))

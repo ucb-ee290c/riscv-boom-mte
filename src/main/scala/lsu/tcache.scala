@@ -7,6 +7,8 @@ import freechips.rocketchip.config.{Parameters}
 import freechips.rocketchip.rocket.{HellaCacheIO, SimpleHellaCacheIF}
 import boom.common._
 import boom.lsu._
+import boom.exu.{BrUpdateInfo}
+import boom.util.{IsKilledByBranch, GetNewBrMask}
 import freechips.rocketchip.util.DescribedSRAM
 import chisel3.experimental.ChiselEnum
 import freechips.rocketchip.tile.HasCoreParameters
@@ -204,6 +206,8 @@ class TCacheCoreIO(implicit p: Parameters) extends BoomBundle()(p) {
     val mteRegionMasks = Input(Vec(mteRegions.size, UInt(width = coreMaxAddrBits.W)))
     /* The tag to return for memory not contained in any tag region */
     val mtePermissiveTag = Input(UInt(width = MTEConfig.tagBits.W))
+    val brupdate = Input(new BrUpdateInfo)
+    val exception = Input(Bool())
 }
 
 class TCacheIO(implicit p: Parameters, tcacheParams: TCacheParams) 
@@ -285,21 +289,21 @@ class BoomNonBlockingTCacheModule(
 
     /* Decode the incoming request */
     val s0_incoming_req = io.lsu.req
-    val s0_incoming_op = Wire(Valid(new TCacheOperation()(p, tcacheParams)))
-    s0_incoming_op.valid := s0_incoming_req.valid
-    s0_incoming_op.bits.replay := false.B
-    s0_incoming_op.bits.requestType := s0_incoming_req.bits.requestType
-    s0_incoming_op.bits.data := Cat(Fill(tcacheParams.blockSizeBytes - MTEConfig.tagBits, 0.U), s0_incoming_req.bits.data)
-    s0_incoming_op.bits.uop := s0_incoming_req.bits.uop
+    val s0_incoming_op = Wire(new TCacheOperation()(p, tcacheParams))
+    val s0_incoming_op_valid = s0_incoming_req.valid
+    s0_incoming_op.requestType := s0_incoming_req.bits.requestType
+    s0_incoming_op.data := Cat(Fill(tcacheParams.blockSizeBytes - MTEConfig.tagBits, 0.U), s0_incoming_req.bits.data)
+    s0_incoming_op.uop := s0_incoming_req.bits.uop
+    s0_incoming_op.replay := false.B
 
     /* Convert the incoming request to a tag storage address if needed */
-    when (s0_incoming_op.bits.requestType === TCacheRequestTypeEnum.READ ||
-            s0_incoming_op.bits.requestType === TCacheRequestTypeEnum.WRITE) {
+    when (s0_incoming_op.requestType === TCacheRequestTypeEnum.READ ||
+            s0_incoming_op.requestType === TCacheRequestTypeEnum.WRITE) {
         val normalAddress = Wire(new NormalPhysicalAddress()(p, tcacheParams))
         normalAddress.address := s0_incoming_req.bits.address
-        s0_incoming_op.bits.address := normalAddress.getTagStoragePhysicalAddress(io.core)
+        s0_incoming_op.address := normalAddress.getTagStoragePhysicalAddress(io.core)
     } .otherwise {
-        assert(s0_incoming_op.bits.requestType === TCacheRequestTypeEnum.FLUSH)
+        assert(s0_incoming_op.requestType === TCacheRequestTypeEnum.FLUSH)
         /* Flushes come in with a pre translated address */
         val tagStorageAddress = Wire(Valid(new TagStoragePhysicalAddress()(p, tcacheParams)))
         tagStorageAddress.bits.address := s0_incoming_req.bits.address
@@ -308,27 +312,32 @@ class BoomNonBlockingTCacheModule(
         //TODO: Revisit this. There are probably power gains to be had by
         //filtering flushes we know our cache won't hold
         tagStorageAddress.valid := true.B
-        s0_incoming_op.bits.address := tagStorageAddress
+        s0_incoming_op.address := tagStorageAddress
     }
 
-    val s0_op = Wire(Valid(new TCacheOperation()(p, tcacheParams)))
+    val s0_op = Wire(new TCacheOperation()(p, tcacheParams))
+    val s0_op_valid = Wire(Bool())
     //TODO: Arbitrate between MSHR write requests
     s0_op := s0_incoming_op
+    s0_op_valid := s0_incoming_op_valid
 
     val s1_op = RegNext(s0_op)
+    val s1_op_valid = RegNext(s0_op_valid && 
+        !IsKilledByBranch(io.core.brupdate, s0_op.uop)) &&
+        !(io.core.exception && s0_op.requestType === TCacheRequestTypeEnum.READ)
     val s1_meta_read_value = Wire(Vec(tcacheParams.nWays, metaT))
     val s1_data_array_idx = Wire(UInt(dataArraysEntries.W))
 
     /* We always need to access meta but don't always care to read data */
     s1_meta_read_value := metaArrays.read(
-        s0_op.bits.address.bits.addressIndex, 
-        s0_op.valid && s0_op.bits.address.valid
+        s0_op.address.bits.addressIndex, 
+        s0_op_valid && s0_op.address.valid
     ).map{ _.asTypeOf(metaT) }
 
     /* Hit all the ways */
     val s1_way_hit_map = VecInit(s1_meta_read_value.map {way_meta =>
         way_meta.cacheTag.valid && 
-            way_meta.cacheTag.bits === s1_op.bits.address.bits.addressTag
+            way_meta.cacheTag.bits === s1_op.address.bits.addressTag
     })
     val s1_way_hit_idx = Mux1H(
         (s1_way_hit_map zip 0.until(tcacheParams.nWays)).map {case (hit, idx) =>
@@ -337,7 +346,7 @@ class BoomNonBlockingTCacheModule(
     )
     val s1_hit = s1_way_hit_map.reduce(_ || _)
 
-    s1_data_array_idx := s1_op.bits.address.bits.addressIndex << nWaysBits | s1_way_hit_idx
+    s1_data_array_idx := s1_op.address.bits.addressIndex << nWaysBits | s1_way_hit_idx
 
     // /* Stage 1: Read */
     // /* Grab the read data for the hit way */
@@ -372,31 +381,34 @@ class BoomNonBlockingTCacheModule(
     // }
     
     val s2_op = RegNext(s1_op)
+    val s2_op_valid = RegNext(s1_op_valid && 
+        !IsKilledByBranch(io.core.brupdate, s1_op.uop)) &&
+        !(io.core.exception && s1_op.requestType === TCacheRequestTypeEnum.READ)
     val s2_data_read_value = Wire(Vec(mteTagsPerBlock, UInt(MTEConfig.tagBits.W)))
-    val s2_op_type = s2_op.bits.requestType
+    val s2_op_type = s2_op.requestType
     val s2_hit = RegNext(s1_hit)
 
     s2_data_read_value := dataArrays.read(
         s1_data_array_idx, 
-        s1_op.valid && s1_op.bits.requestType === TCacheRequestTypeEnum.READ && 
-            s1_op.bits.address.valid && s1_hit
+        s1_op_valid && s1_op.requestType === TCacheRequestTypeEnum.READ && 
+            s1_op.address.valid && s1_hit
     )
 
     /* Craft the response */
     val resp = io.lsu.resp
-    resp.bits.uop := s2_op.bits.uop
-    when (!s2_op.valid) {
+    resp.bits.uop := s2_op.uop
+    when (!s2_op_valid) {
         /* The request isn't valid, so we can't possibly have anything to say */
         resp.valid := false.B
         resp.bits := DontCare
     } .elsewhen(s2_op_type === TCacheRequestTypeEnum.READ) {
-        when (!s2_op.bits.address.valid) {
+        when (!s2_op.address.valid) {
             /* 
             If the request is good but the address is not, this indicates that
             we launched a request for a region not covered by MTE. In this case,
             we simply return the permissive tag
             */
-	        printf("[tache] resp default = uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d\n", s2_op.bits.uop.uses_ldq, s2_op.bits.uop.ldq_idx, s2_op.bits.uop.uses_stq, s2_op.bits.uop.stq_idx) 
+	        printf("[tache] resp default = uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d\n", s2_op.uop.uses_ldq, s2_op.uop.ldq_idx, s2_op.uop.uses_stq, s2_op.uop.stq_idx) 
             resp.valid := true.B
             resp.bits.data := io.core.mtePermissiveTag
         } .otherwise {
@@ -406,7 +418,7 @@ class BoomNonBlockingTCacheModule(
             bit
             */
             resp.valid := s2_hit
-            resp.bits.data := s2_data_read_value(s2_op.bits.address.bits.blockOffset)
+            resp.bits.data := s2_data_read_value(s2_op.address.bits.blockOffset)
             assert(false.B, "not impl")
         }
     } .otherwise {
@@ -476,6 +488,7 @@ class TCacheMSHRModule(
         op.valid := true.B
     }
     
+    //TODO: Support brupdate
     //TODO: Support writes
     val op_valid = Mux(io.req_op.fire, io.req_op.valid, op.valid)
     val op_address = Mux(io.req_op.fire, io.req_op.bits.address, op.bits.address)

@@ -857,7 +857,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // Tag Cache Access
   // Launch requests into the tag cache
   def ldq_dump() = {
-    printf("[lsu] ---LDQ DUMP\n")
+    printf("[lsu] ---LDQ DUMP (tsc=%d)\nhead=%d, tail=%d\n", io.core.tsc_reg, ldq_head, ldq_tail)
     for (i <- 0 until numLdqEntries) {
       val ldq_e = ldq(i)
       val ldq_b = ldq_e.bits
@@ -868,7 +868,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   }
 
   def stq_dump() = {
-    printf("[lsu] ---STQ DUMP\n")
+    printf("[lsu] ---STQ DUMP (tsc=%d)\nhead=%d, tail=%d, commit head=%d\n", io.core.tsc_reg, stq_head, stq_tail, stq_commit_head)
     for (i <- 0 until numStqEntries) {
       val stq_e = stq(i)
       val stq_b = stq_e.bits
@@ -940,7 +940,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       val req = tcacheIO.req
       val reqB = req.bits
       when (tcache_will_fire(w)) {
-        printf("A %d, B %d, C %d, D %d, E %d, F %d, G %d\n", 
+        printf("[lsu] tcache_will_fire pc=%x (%x), ld_i %d, stad_i %d, sta_i %d, ld_r %d, sta_r %d, ld_t_r %d, st_t_r %d\n", 
+            tcache_uop(w).debug_pc,
+            tcache_uop(w).debug_inst,
             will_fire_load_incoming (w),
             will_fire_stad_incoming (w),
             will_fire_sta_incoming  (w),
@@ -996,21 +998,21 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     when (resp.valid) {
 	    
       when (respB.uop.uses_ldq) {
-        printf("[lsu] LDQ %x tcache response arrived\n", respB.uop.ldq_idx)
+        printf("[lsu] LDQ %x, addr=%x tcache response arrived\n", respB.uop.ldq_idx, ldq(respB.uop.ldq_idx).bits.addr.bits)
         val ldq_e = ldq(respB.uop.ldq_idx)
-        // assert(ldq_e.valid, "TCache response for invalid/freed entry")
-        // assert(ldq_e.bits.phys_mte_tag_executed.get, "TCache response for non-executed entry")
-        // assert(!ldq_e.bits.phys_mte_tag.get.valid, "TCache response attempting to overwrite valid tag")
+        assert(ldq_e.valid, "TCache response for invalid/freed entry")
+        assert(ldq_e.bits.phys_mte_tag_executed.get, "TCache response for non-executed entry")
+        assert(!ldq_e.bits.phys_mte_tag.get.valid, "TCache response attempting to overwrite valid tag")
         val tag = ldq_e.bits.phys_mte_tag.get
         tag.valid := true.B
         tag.bits := respB.data
 	      ldq_dump()
       }.elsewhen(respB.uop.uses_stq) {
-        printf("[lsu] STQ %x tcache response arrived\n", respB.uop.stq_idx)
+        printf("[lsu] STQ %x, addr=%x tcache response arrived\n", respB.uop.stq_idx, stq(respB.uop.stq_idx).bits.addr.bits)
         val stq_e = stq(respB.uop.stq_idx)
-        // assert(stq_e.valid, "TCache response for invalid/freed entry")
-        // assert(stq_e.bits.phys_mte_tag_executed.get, "TCache response for non-executed entry")
-        // assert(!stq_e.bits.phys_mte_tag.get.valid, "TCache response attempting to overwrite valid tag")
+        assert(stq_e.valid, "TCache response for invalid/freed entry")
+        assert(stq_e.bits.phys_mte_tag_executed.get, "TCache response for non-executed entry")
+        assert(!stq_e.bits.phys_mte_tag.get.valid, "TCache response attempting to overwrite valid tag")
 
         val tag = stq_e.bits.phys_mte_tag.get
         tag.valid := true.B
@@ -1612,7 +1614,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         val ldq_idx = io.dmem.resp(w).bits.uop.ldq_idx
         val send_iresp = ldq(ldq_idx).bits.uop.dst_rtype === RT_FIX
         val send_fresp = ldq(ldq_idx).bits.uop.dst_rtype === RT_FLT
-        assert(ldq(ldq_idx).valid, "UaF!!! dmem returned data for dead ldq entry")
+        ldq_dump()
+        stq_dump()
+        printf("[lsu] dmem LDQ %d addr=%x\n", ldq_idx, ldq(ldq_idx).bits.addr.bits)
 
         io.core.exe(w).iresp.bits.uop  := ldq(ldq_idx).bits.uop
         io.core.exe(w).fresp.bits.uop  := ldq(ldq_idx).bits.uop
@@ -1631,6 +1635,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       {
         assert(!io.dmem.resp(w).bits.is_hella)
         stq(io.dmem.resp(w).bits.uop.stq_idx).bits.succeeded := true.B
+        ldq_dump()
+        stq_dump()
+        printf("[lsu] dmem STQ %d addr=%x\n", io.dmem.resp(w).bits.uop.stq_idx, stq(io.dmem.resp(w).bits.uop.stq_idx).bits.addr.bits)
         when (io.dmem.resp(w).bits.uop.is_amo) {
           dmem_resp_fired(w) := true.B
           io.core.exe(w).iresp.valid     := true.B
@@ -1712,6 +1719,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         stq(i).valid           := false.B
         stq(i).bits.addr.valid := false.B
         stq(i).bits.data.valid := false.B
+        if (useMTE) {
+          stq(i).bits.phys_mte_tag.get.valid := false.B
+        }
+        printf("[lsu] STQ %d, addr=%x killed by branch\n", i.U, stq(i).bits.addr.bits)
         st_brkilled_mask(i)    := true.B
       }
     }
@@ -1730,6 +1741,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       {
         ldq(i).valid           := false.B
         ldq(i).bits.addr.valid := false.B
+        if (useMTE) {
+          ldq(i).bits.phys_mte_tag.get.valid := false.B
+        }
+        printf("[lsu] LDQ %d, addr=%x killed by branch\n", i.U, ldq(i).bits.addr.bits)
       }
     }
   }
@@ -1753,7 +1768,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   {
     val commit_store = io.core.commit.valids(w) && io.core.commit.uops(w).uses_stq
     val commit_load  = io.core.commit.valids(w) && io.core.commit.uops(w).uses_ldq
-    val idx = Mux(commit_store, temp_stq_commit_head, temp_ldq_head)
+    val idx = Mux(commit_store, io.core.commit.uops(w).stq_idx, io.core.commit.uops(w).ldq_idx)
     when (commit_store)
     {
       stq(idx).bits.committed := true.B
@@ -1776,7 +1791,16 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                             ldq(idx).bits.addr_mte_tag.getOrElse(0.U))
         printf("MT %x %x %x %x %x %x %x %x\n",
           io.core.tsc_reg, uop.uopc, uop.mem_cmd, uop.mem_size, addr, stdata, wbdata, addr_tag)
+        printf("[LSU] core commit pc=%x, addr=%x\n", uop.debug_pc, addr)
       }
+    }
+    when (io.core.commit.valids(w)) {
+      val general_commit_uopc = io.core.commit.uops(w)
+      dontTouch(general_commit_uopc)
+      printf("[LSU] general commit pc=%x, uopc=%d, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d, commit_load=%d, commit_store=%d\n", 
+      general_commit_uopc.debug_pc, general_commit_uopc.uopc, general_commit_uopc.uses_ldq, general_commit_uopc.ldq_idx,
+      general_commit_uopc.uses_stq, general_commit_uopc.stq_idx,
+      commit_load, commit_store)
     }
 
     temp_stq_commit_head = Mux(commit_store,
@@ -1859,6 +1883,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     stq_head_e.bits.data.valid := false.B
     stq_head_e.bits.succeeded  := false.B
     stq_head_e.bits.committed  := false.B
+    if (useMTE) {
+        stq_head_e.bits.phys_mte_tag.get.valid := false.B
+        stq_head_e.bits.phys_mte_tag.get.bits := 0xa.U
+    }
 
     stq_head := WrapInc(stq_head, numStqEntries)
     when (stq_head_e.bits.uop.is_fence)
