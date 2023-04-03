@@ -998,24 +998,29 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     when (resp.valid) {
 	    
       when (respB.uop.uses_ldq) {
-        printf("[lsu] LDQ %x, addr=%x tcache response arrived\n", respB.uop.ldq_idx, ldq(respB.uop.ldq_idx).bits.addr.bits)
+        printf("[lsu] tcache response arrived LDQ %x, addr=%x, nack=%d, tag=%x\n", respB.uop.ldq_idx, ldq(respB.uop.ldq_idx).bits.addr.bits, respB.nack,respB.data)
         val ldq_e = ldq(respB.uop.ldq_idx)
         assert(ldq_e.valid, "TCache response for invalid/freed entry")
         assert(ldq_e.bits.phys_mte_tag_executed.get, "TCache response for non-executed entry")
         assert(!ldq_e.bits.phys_mte_tag.get.valid, "TCache response attempting to overwrite valid tag")
+
+        /* If we were nack'd, clear executed so we replay */
+        ldq_e.bits.phys_mte_tag_executed.get := !respB.nack
         val tag = ldq_e.bits.phys_mte_tag.get
-        tag.valid := true.B
+        tag.valid := !respB.nack
         tag.bits := respB.data
 	      ldq_dump()
       }.elsewhen(respB.uop.uses_stq) {
-        printf("[lsu] STQ %x, addr=%x tcache response arrived\n", respB.uop.stq_idx, stq(respB.uop.stq_idx).bits.addr.bits)
+        printf("[lsu] tcache response arrived STQ %x, addr=%x, nack=%d, tag=%x\n", respB.uop.stq_idx, stq(respB.uop.stq_idx).bits.addr.bits, respB.nack,respB.data)
         val stq_e = stq(respB.uop.stq_idx)
         assert(stq_e.valid, "TCache response for invalid/freed entry")
         assert(stq_e.bits.phys_mte_tag_executed.get, "TCache response for non-executed entry")
         assert(!stq_e.bits.phys_mte_tag.get.valid, "TCache response attempting to overwrite valid tag")
 
+        /* If we were nack'd, clear executed so we replay */
+        stq_e.bits.phys_mte_tag_executed.get := !respB.nack
         val tag = stq_e.bits.phys_mte_tag.get
-        tag.valid := true.B
+        tag.valid := !respB.nack
         tag.bits := respB.data
 	      stq_dump()
       }.otherwise {
@@ -1609,14 +1614,14 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     when (io.dmem.resp(w).valid)
     {
       when (io.dmem.resp(w).bits.uop.uses_ldq)
-      {
+    {
         assert(!io.dmem.resp(w).bits.is_hella)
         val ldq_idx = io.dmem.resp(w).bits.uop.ldq_idx
         val send_iresp = ldq(ldq_idx).bits.uop.dst_rtype === RT_FIX
         val send_fresp = ldq(ldq_idx).bits.uop.dst_rtype === RT_FLT
-        ldq_dump()
-        stq_dump()
-        printf("[lsu] dmem LDQ %d addr=%x\n", ldq_idx, ldq(ldq_idx).bits.addr.bits)
+        // ldq_dump()
+        // stq_dump()
+        // printf("[lsu] dmem LDQ %d addr=%x\n", ldq_idx, ldq(ldq_idx).bits.addr.bits)
 
         io.core.exe(w).iresp.bits.uop  := ldq(ldq_idx).bits.uop
         io.core.exe(w).fresp.bits.uop  := ldq(ldq_idx).bits.uop
@@ -1635,9 +1640,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       {
         assert(!io.dmem.resp(w).bits.is_hella)
         stq(io.dmem.resp(w).bits.uop.stq_idx).bits.succeeded := true.B
-        ldq_dump()
-        stq_dump()
-        printf("[lsu] dmem STQ %d addr=%x\n", io.dmem.resp(w).bits.uop.stq_idx, stq(io.dmem.resp(w).bits.uop.stq_idx).bits.addr.bits)
+        // ldq_dump()
+        // stq_dump()
+        // printf("[lsu] dmem STQ %d addr=%x\n", io.dmem.resp(w).bits.uop.stq_idx, stq(io.dmem.resp(w).bits.uop.stq_idx).bits.addr.bits)
         when (io.dmem.resp(w).bits.uop.is_amo) {
           dmem_resp_fired(w) := true.B
           io.core.exe(w).iresp.valid     := true.B
@@ -1794,14 +1799,14 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         printf("[LSU] core commit pc=%x, addr=%x\n", uop.debug_pc, addr)
       }
     }
-    when (io.core.commit.valids(w)) {
-      val general_commit_uopc = io.core.commit.uops(w)
-      dontTouch(general_commit_uopc)
-      printf("[LSU] general commit pc=%x, uopc=%d, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d, commit_load=%d, commit_store=%d\n", 
-      general_commit_uopc.debug_pc, general_commit_uopc.uopc, general_commit_uopc.uses_ldq, general_commit_uopc.ldq_idx,
-      general_commit_uopc.uses_stq, general_commit_uopc.stq_idx,
-      commit_load, commit_store)
-    }
+    // when (io.core.commit.valids(w)) {
+    //   val general_commit_uopc = io.core.commit.uops(w)
+    //   dontTouch(general_commit_uopc)
+    //   printf("[LSU] general commit pc=%x, uopc=%d, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d, commit_load=%d, commit_store=%d\n", 
+    //   general_commit_uopc.debug_pc, general_commit_uopc.uopc, general_commit_uopc.uses_ldq, general_commit_uopc.ldq_idx,
+    //   general_commit_uopc.uses_stq, general_commit_uopc.stq_idx,
+    //   commit_load, commit_store)
+    // }
 
     temp_stq_commit_head = Mux(commit_store,
                                WrapInc(temp_stq_commit_head, numStqEntries),
@@ -1913,7 +1918,18 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     can_fire_hella_incoming(memWidth-1) := true.B
 
     hella_data := io.hellacache.s1_data
-    hella_xcpt := dtlb.io.resp(memWidth-1)
+    when (hella_req.no_xcpt) {
+      hella_xcpt := dtlb.io.resp(memWidth-1)
+    } .otherwise {
+      /* XXX: no_excpt === false apparently is supposed to SUPRESS exceptions */
+      val no_exceptions = Wire(new rocket.AlignmentExceptions)
+      no_exceptions.ld := false.B
+      no_exceptions.st := false.B
+      hella_xcpt.ma := no_exceptions
+      hella_xcpt.pf := no_exceptions
+      hella_xcpt.gf := no_exceptions
+      hella_xcpt.ae := no_exceptions
+    }
 
     when (io.hellacache.s1_kill) {
       when (will_fire_hella_incoming(memWidth-1) && dmem_req_fire(memWidth-1)) {
@@ -1932,6 +1948,13 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   } .elsewhen (hella_state === h_s2) {
     io.hellacache.s2_xcpt := hella_xcpt
     when (io.hellacache.s2_kill || hella_xcpt.asUInt =/= 0.U) {
+      printf("[lsu] killing hellacache s2 request <addr=%x, size=%d, tag=%d>, s2_kill=%d, ma=%d, %d, pf=%d, %d, gf=%d, %d, ae=%d, %d",
+              hella_req.addr, hella_req.size, hella_req.tag,
+              io.hellacache.s2_kill,
+              hella_xcpt.ma.ld, hella_xcpt.ma.st,
+              hella_xcpt.pf.ld, hella_xcpt.pf.st,
+              hella_xcpt.gf.ld, hella_xcpt.gf.st,
+              hella_xcpt.ae.ld, hella_xcpt.ae.st)
       hella_state := h_dead
     } .otherwise {
       hella_state := h_wait
@@ -1940,7 +1963,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     for (w <- 0 until memWidth) {
       when (io.dmem.resp(w).valid && io.dmem.resp(w).bits.is_hella) {
         hella_state := h_ready
-
+        printf("[lsu] hella dmem response addr=%x, dmem_data=%x\n", hella_req.addr, io.dmem.resp(w).bits.data)
         io.hellacache.resp.valid       := true.B
         io.hellacache.resp.bits.addr   := hella_req.addr
         io.hellacache.resp.bits.tag    := hella_req.tag
@@ -1949,6 +1972,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         io.hellacache.resp.bits.size   := hella_req.size
         io.hellacache.resp.bits.data   := io.dmem.resp(w).bits.data
       } .elsewhen (io.dmem.nack(w).valid && io.dmem.nack(w).bits.is_hella) {
+        printf("[lsu] hella dmem nack addr=%x\n", hella_req.addr)
         hella_state := h_replay
       }
     }
