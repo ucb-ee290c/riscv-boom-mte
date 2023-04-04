@@ -591,7 +591,7 @@ class WithNSmallMTEBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) exten
                 nSets = 8,
                 nWays = 2,
                 blockSizeBytes = 8,
-                nMSHRs = 1
+                nMSHRs = 4
               )
             ),
             hartId = i + idOffset
