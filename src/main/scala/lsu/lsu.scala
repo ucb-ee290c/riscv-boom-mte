@@ -607,7 +607,12 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     //XXX: ibd
     stq_tag_retry_e.valid && stq_e_can_tag_retry(stq_tag_retry_e.bits)
   )
-
+  // val can_fire_stq_tag_write = widthMap(w => 
+  //   exe_req(w).valid && exe_req(w).bits.uop.uopc === uopMTE_STTI
+  // )
+  // val can_fire_stq_tag_write_retry = widthMap(w => 
+  //   exe_req(w).valid && exe_req(w).bits.uop.uopc === uopMTE_STTI
+  // )
   // val can_fire_tcache_ld_incoming = WireInit(widthMap(w => 
   //   if (!useMte) {
   //     false.B
@@ -934,13 +939,15 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                        will_fire_sta_incoming  (w))
 
   if (useMTE) {
-    require(memWidth == 1, "Tag cacte does not support width > 1")
+    require(memWidth == 1, "Tag cache does not support width > 1")
     val tcacheIO = io.tcache.get
     for (w <- 0 until memWidth) {
       val req = tcacheIO.req
       val reqB = req.bits
       when (tcache_will_fire(w)) {
-        printf("[lsu] tcache_will_fire pc=%x (%x), ld_i %d, stad_i %d, sta_i %d, ld_r %d, sta_r %d, ld_t_r %d, st_t_r %d\n", 
+        printf("[lsu] tcache_will_fire addr=%x, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d, pc=%x (%x), ld_i %d, stad_i %d, sta_i %d, ld_r %d, sta_r %d, ld_t_r %d, st_t_r %d\n", 
+            tcache_addr(w).bits,
+            tcache_uop(w).uses_ldq, tcache_uop(w).ldq_idx, tcache_uop(w).uses_stq, tcache_uop(w).stq_idx,
             tcache_uop(w).debug_pc,
             tcache_uop(w).debug_inst,
             will_fire_load_incoming (w),
@@ -962,28 +969,47 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         maxed on misses) and if the address translation completed (either due to
         a TLB hit this cycle or from a previous if this is a retry)
         */
-        val can_fire = req.ready && tcache_addr(w).valid
-        reqB.uop := tcache_uop(w)
 
         //TODO: Support tag writes
         reqB.requestType := TCacheRequestTypeEnum.READ
         reqB.address := tcache_addr(w).bits
         reqB.data := DontCare
 
+        val is_fence = tcache_uop(w).is_fence || tcache_uop(w).is_fencei
+        val can_fire = req.ready && tcache_addr(w).valid && 
+          !IsKilledByBranch(io.core.brupdate, tcache_uop(w)) &&
+          !(io.core.exception && reqB.requestType === TCacheRequestTypeEnum.READ) && 
+          !is_fence
+        reqB.uop := tcache_uop(w)
+        reqB.uop.br_mask := GetNewBrMask(io.core.brupdate, tcache_uop(w).br_mask)
+
         /* If we're good to go, launch it! */
         req.valid := can_fire
         when (tcache_ldq_e(w).valid) {
+          assert(!is_fence, "Fences should never travel down ldq")
 	        val e = ldq(tcache_uop(w).ldq_idx)
-          assert(tcache_is_incoming(w) || !/*tcache_ldq_e(w)*/e.bits.phys_mte_tag_executed.get, "Already executed?")
+          assert(tcache_is_incoming(w) || !e.bits.phys_mte_tag_executed.get, "Already executed?")
 	        printf("[lsu] LDQ %x, tcache_can_fire=%d, addr=%x\n", tcache_uop(w).ldq_idx, can_fire, reqB.address)
-          /*tcache_ldq_e(w)*/e.bits.phys_mte_tag_executed.get := can_fire
-	  ldq_dump()
+          e.bits.phys_mte_tag_executed.get := can_fire
+	        ldq_dump()
         }.elsewhen(tcache_stq_e(w).valid) {
 	        val e = stq(tcache_uop(w).stq_idx)
-          assert(tcache_is_incoming(w) || !/*tcache_stq_e(w)*/e.bits.phys_mte_tag_executed.get, "Already executed?")
+          assert(tcache_is_incoming(w) || !e.bits.phys_mte_tag_executed.get, "Already executed?")
 	        printf("[lsu] STQ %x, tcache_can_fire=%d, addr=%x\n", tcache_uop(w).stq_idx, can_fire, reqB.address)
-          /*tcache_stq_e(w)*/e.bits.phys_mte_tag_executed.get := can_fire
-	  stq_dump()
+          e.bits.phys_mte_tag_executed.get := can_fire
+
+          when (is_fence) {
+            /* 
+            XXX: fences don't have an address so there's no need tags. 
+            Rather than fix this so that we're not lying about having tags, we
+            stuff dummy tags now so we fences don't block
+            */
+            e.bits.phys_mte_tag_executed.get := true.B
+            e.bits.phys_mte_tag.get.valid := true.B
+            e.bits.phys_mte_tag.get.bits := 0xc.U
+          }
+
+	        stq_dump()
         } /* otherwise should be unreachable, already asserted above */
       }.otherwise {
         req.valid := false.B
@@ -1726,6 +1752,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         stq(i).bits.data.valid := false.B
         if (useMTE) {
           stq(i).bits.phys_mte_tag.get.valid := false.B
+          stq(i).bits.phys_mte_tag.get.bits := 0xb.U
+          stq(i).bits.phys_mte_tag_executed.get := false.B
         }
         printf("[lsu] STQ %d, addr=%x killed by branch\n", i.U, stq(i).bits.addr.bits)
         st_brkilled_mask(i)    := true.B
@@ -1748,6 +1776,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         ldq(i).bits.addr.valid := false.B
         if (useMTE) {
           ldq(i).bits.phys_mte_tag.get.valid := false.B
+          ldq(i).bits.phys_mte_tag.get.bits := 0xb.U
+          ldq(i).bits.phys_mte_tag_executed.get := false.B
         }
         printf("[lsu] LDQ %d, addr=%x killed by branch\n", i.U, ldq(i).bits.addr.bits)
       }
@@ -1845,6 +1875,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     if (useMTE) {
         ldq_head_e.bits.phys_mte_tag.get.valid := false.B
         ldq_head_e.bits.phys_mte_tag.get.bits := 0xa.U
+        ldq_head_e.bits.phys_mte_tag_executed.get := false.B
     }
 
     ldq_head :=  WrapInc(ldq_head, numLdqEntries)
@@ -1873,7 +1904,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   {
   if (useMTE) {
       assert (
-        stq_head_e.bits.phys_mte_tag_executed.get, 
+        // XXX: Fences launch tcache requests which can arrive after they're cleared
+        // We need to prevent them from firing tcache requests
+        stq_head_e.bits.uop.is_fence || stq_head_e.bits.phys_mte_tag_executed.get, 
         "[lsu] trying to clear store before tags have arrived."
       )
     }
@@ -1891,6 +1924,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     if (useMTE) {
         stq_head_e.bits.phys_mte_tag.get.valid := false.B
         stq_head_e.bits.phys_mte_tag.get.bits := 0xa.U
+        stq_head_e.bits.phys_mte_tag_executed.get := false.B
     }
 
     stq_head := WrapInc(stq_head, numStqEntries)
@@ -2019,7 +2053,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       .otherwise // exception
     {
       stq_tail := stq_commit_head
-
+      printf("[lsu] exception! killing loads and stores")
       for (i <- 0 until numStqEntries)
       {
         when (!stq(i).bits.committed && !stq(i).bits.succeeded)

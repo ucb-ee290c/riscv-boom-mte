@@ -15,6 +15,7 @@ import freechips.rocketchip.tile.HasCoreParameters
 import freechips.rocketchip.rocket.PRV
 import freechips.rocketchip.util.RandomReplacement
 import freechips.rocketchip.util.UIntToOH1
+import boom.exu.BrUpdateMasks
 
 case class TCacheParams(
     // /**
@@ -490,12 +491,14 @@ class BoomNonBlockingTCacheModule(
     }
 
     when (s0_op_valid) {
-        printf("[tcache] decoded tag storage address -> %x (sel=%x)\n", s0_op.address.bits.address, s0_op.address.bits.subByteTagSelect)
+        assert(s0_is_executing_replay ^ io.lsu.req.fire, "Arbiter drew from two sources?")
+        printf("[tcache] decoded tag storage address -> %x (sel=%x) uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d\n", s0_op.address.bits.address, s0_op.address.bits.subByteTagSelect, s0_op.uop.uses_ldq, s0_op.uop.ldq_idx, s0_op.uop.uses_stq, s0_op.uop.stq_idx)
     }
 
     /* ~* Stage 1 *~ */
 
     val s1_op = RegNext(s0_op)
+    s1_op.uop.br_mask := GetNewBrMask(io.core.brupdate, s0_op.uop)
     val s1_op_valid = RegNext(s0_op_valid && 
         !IsKilledByBranch(io.core.brupdate, s0_op.uop) &&
         !(io.core.exception && s0_op.requestType === TCacheRequestTypeEnum.READ))
@@ -702,16 +705,21 @@ class BoomNonBlockingTCacheModule(
         Simple misses can be directly passed off to the MSHR. When they
         complete, a new replay operation will be submitted.
         */
-        available_mshr.req_op.valid := true.B
+        val uop = s1_op.uop
+        available_mshr.req_op.valid := 
+            !IsKilledByBranch(io.core.brupdate, uop) &&
+            !(io.core.exception && s1_op.requestType === TCacheRequestTypeEnum.READ)
         available_mshr.req_op.bits := s1_op
+        available_mshr.req_op.bits.uop.br_mask := GetNewBrMask(io.core.brupdate, uop)
     }
 
     /* ~* Stage 2 *~ */
 
     val s2_op = RegNext(s1_op)
+    s2_op.uop.br_mask := GetNewBrMask(io.core.brupdate, s1_op.uop)
     val s2_op_valid = RegNext(s1_op_valid && 
-        !IsKilledByBranch(io.core.brupdate, s1_op.uop)) &&
-        !(io.core.exception && s1_op.requestType === TCacheRequestTypeEnum.READ)
+        !IsKilledByBranch(io.core.brupdate, s1_op.uop) &&
+        !(io.core.exception && s1_op.requestType === TCacheRequestTypeEnum.READ))
     val s2_op_type = s2_op.requestType
     val s2_hit = RegNext(s1_hit)
     val s2_nack = RegNext(s1_nack)
@@ -889,21 +897,28 @@ class TCacheMSHRModule(
         op_i.bits := DontCare
         op_i
     })
+    dontTouch(io.req_op.bits.uop)
 
     val blocked_address_r = Reg(UInt(coreMaxAddrBits.W))
     io.blocked_address.bits := blocked_address_r
 
     /** Have we fired the request into memory? */
     val executed_r = Reg(Bool())
+    /** Have we fired a request into memory and are waiting for it to return? */
+    val memory_executing = RegInit(false.B)
 
     val s1_data_r = Reg(Valid(UInt((tcacheParams.blockSizeBytes * 8).W)))
 
-    /* We can accept a new request when we're done with the one we have */
-    io.req_op.ready := !op_r.valid
+    /* 
+    We can accept a new request when we're done with the one we have and no we
+    have no pending responses from memory (i.e. we're fully clean)
+    */
+    io.req_op.ready := !op_r.valid && !memory_executing
     when (io.req_op.fire) {
     	assert(io.req_op.valid && io.req_op.bits.address.valid, "MSHR was fired an invalid op?")
         assert(!TCacheRequestTypeEnum.is_replay(io.req_op.bits.requestType), "MSHR was fired a replay?")
-        printf("[mshr] accepted new op, addr=%x\n", io.req_op.bits.address.bits.address)
+        printf("[mshr] accepted new op, addr=%x, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d\n", io.req_op.bits.address.bits.address, io.req_op.bits.uop.uses_ldq, io.req_op.bits.uop.ldq_idx, io.req_op.bits.uop.uses_stq, io.req_op.bits.uop.stq_idx)
+
         op_r.bits := io.req_op.bits
         executed_r := false.B
         s1_data_r.valid := false.B
@@ -933,12 +948,13 @@ class TCacheMSHRModule(
     val op_type = op.requestType
     val op_v = Mux(io.req_op.fire, io.req_op.valid, op_r.valid) &&
         !IsKilledByBranch(io.brupdate, op.uop) &&
-        !(io.exception && op_type === TCacheRequestTypeEnum.READ)
+        !(io.exception && op.requestType === TCacheRequestTypeEnum.READ)
     val executed = Mux(io.req_op.fire, false.B, executed_r)
     
     op_r.valid := op_v &&
                     /* Invalidate after we fire the response */
                     !io.resp_op.fire
+    op_r.bits.uop.br_mask := GetNewBrMask(io.brupdate, op.uop)
     io.blocked_address.valid := op_r.valid
 
 
@@ -984,6 +1000,7 @@ class TCacheMSHRModule(
     when (op_v && io.mem.req.fire) {
         printf("[mshr] firing req addr=%x, cmd=%x\n", io.mem.req.bits.addr, io.mem.req.bits.cmd)
         executed_r := true.B
+        memory_executing := true.B
     }
 
     /* ~* Handle memory response *~ */
@@ -998,8 +1015,11 @@ class TCacheMSHRModule(
     val resp_op_b = io.resp_op.bits
     // We use op_r here rather than op_v to break the combinational loop
     // we don't need op_v anyways since we'll never be valid in cycle 0
-    io.resp_op.valid := should_send_resp && (resp_mem_v || resp_op_v_r)
-    resp_op_b := op
+    io.resp_op.valid := should_send_resp && (resp_mem_v || resp_op_v_r) &&
+        !IsKilledByBranch(io.brupdate, op_r.bits.uop) &&
+        !(io.exception && op_r.bits.requestType === TCacheRequestTypeEnum.READ)
+    resp_op_b := op_r.bits
+    resp_op_b.uop.br_mask := GetNewBrMask(io.brupdate, op_r.bits.uop)
     when (op_r.bits.requestType === TCacheRequestTypeEnum.READ) {
         resp_op_b.requestType := TCacheRequestTypeEnum.REPLAY_READ
     } .elsewhen (op_r.bits.requestType === TCacheRequestTypeEnum.WRITE) {
@@ -1028,16 +1048,17 @@ class TCacheMSHRModule(
         resp_op_b.data := resp_line
     }
 
+    assert(!(resp_mem_v && io.req_op.ready), "Memory arrived while MSHR deallocated?")
     when (op_r.valid && resp_mem_v) {
         printf("[mshr] fetched addr=%x, data=%x\n", op_address.bits.address, resp_line)
         resp_line_r := resp_mem_b.data
         resp_op_v_r := should_send_resp
+        memory_executing := false.B
     }
 
     when (io.resp_op.fire) {
         resp_op_v_r := false.B
     }
-
 }
 
 
