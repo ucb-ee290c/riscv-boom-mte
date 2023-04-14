@@ -528,7 +528,21 @@ class MemAddrCalcUnit(implicit p: Parameters)
   with freechips.rocketchip.rocket.constants.ScalarOpConstants
 {
   // perform address calculation
-  val sum = (io.req.bits.rs1_data.asSInt + io.req.bits.uop.imm_packed(19,8).asSInt).asUInt
+  val addr_imm_offset = Wire(SInt(LONGEST_IMM_SZ.W))
+  if (useMTE) {
+    when (io.req.bits.uop.uopc === uopMTE_STTI) {
+      // Use the lower 8 bits as an address offset
+      addr_imm_offset := io.req.bits.uop.imm_packed(15, 8).asSInt
+    } .otherwise {
+      addr_imm_offset := io.req.bits.uop.imm_packed(19, 8).asSInt
+    }
+  } else {
+    addr_imm_offset := io.req.bits.uop.imm_packed(19, 8).asSInt
+  }
+
+  val sum = (io.req.bits.rs1_data.asSInt + addr_imm_offset).asUInt
+  // val sum = (io.req.bits.rs1_data.asSInt + io.req.bits.uop.imm_packed(19, 8).asSInt).asUInt
+
   //FIXME: We don't handle this correctly. Priv Spec 4.4.1 says we must raise
   //       a page fault but instead we're simply smearing.
   val ea_sign = {
@@ -539,21 +553,29 @@ class MemAddrCalcUnit(implicit p: Parameters)
     }
   }
   val effective_address = Cat(ea_sign, sum(vaddrBits-1,0)).asUInt
+  val store_data = Wire(UInt(dataWidth.W))
   if (useMTE) {
     // Extract the tag from the non-offset address as we state that the tag field
     // will not be overflowed.
     val addr_tag = io.req.bits.rs1_data(xLen - 1, xLen - MTEConfig.tagBits)
     io.resp.bits.mte_tag.get := addr_tag
-  }
 
-  val store_data = io.req.bits.rs2_data
-//   todo: add tagging to the FuncUnitResp and have it pass that back here.
-//   this will mean that we fully detach tags prior to the addresses entering the LSU.
-//   bug: priv spec 4.4.1 says "Instruction fetch addresses and load and store
+    when (io.req.bits.uop.uopc === uopMTE_STTI) {
+      /* Use the upper four bits of the immediate to advance the write tag argument */
+      val new_tag = addr_tag + io.req.bits.uop.imm_packed(19, 16)
+      store_data := Cat(Fill(dataWidth - MTEConfig.tagBits, 0.U), new_tag)
+    } .otherwise {
+      store_data := io.req.bits.rs2_data
+    }
+  } else {
+    store_data := io.req.bits.rs2_data
+  }
+// bug: priv spec 4.4.1 says "Instruction fetch addresses and load and store
 // effective addresses, which are 64 bits, must have bits 63–39 all equal to bit 38, or else a page-fault
 // exception will occur. ". This does not seem to be implemented. Instead, a 
   io.resp.bits.addr := effective_address
   io.resp.bits.data := store_data
+
   
   if (dataWidth > 63) {
     assert (!(io.req.valid && io.req.bits.uop.ctrl.is_std &&
