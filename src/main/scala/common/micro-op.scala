@@ -152,6 +152,8 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   def unsafe           = uses_ldq || (uses_stq && !is_fence) || is_br || is_jalr
 
   def fu_code_is(_fu: UInt) = (fu_code & _fu) =/= 0.U
+
+  def is_mte_tag_write = uopc === uopMTE_STTI
 }
 
 /**

@@ -16,6 +16,7 @@ import freechips.rocketchip.rocket.PRV
 import freechips.rocketchip.util.RandomReplacement
 import freechips.rocketchip.util.UIntToOH1
 import boom.exu.BrUpdateMasks
+import java.net.Authenticator.RequestorType
 
 case class TCacheParams(
     // /**
@@ -146,15 +147,15 @@ class NormalPhysicalAddress(implicit p: Parameters, tcacheParams: TCacheParams)
         [: 5] byte region offset
 
         Generically:
-        [granuleBytes2 : 0] granule offset
-        [mteTagsPerByteBits - 1 + granuleBytes2 + 1: granuleBytes2 + 1] sub-byte tag sel
-        [: 1 + mteTagsPerByteBits - 1 + granuleBytes2 + 1] byte region offset
+        [granuleBytes2 - 1 : 0] granule offset
+        [mteTagsPerByteBits + granuleBytes2 - 1: granuleBytes2] sub-byte tag sel
+        [: 1 + mteTagsPerByteBits - 1 + granuleBytes2] byte region offset
         */
         val granuleBytes2 = log2Ceil(MTEConfig.taggingGranuleBytes)
-        val subByteTagSelectIdxBegin = granuleBytes2 + 1
-        val subByteTagSelectIdxEnd = mteTagsPerBlockBits - 1 + subByteTagSelectIdxBegin
+        val subByteTagSelectIdxBegin = granuleBytes2
+        val subByteTagSelectIdxEnd = log2Ceil(mteTagsPerByte) + subByteTagSelectIdxBegin - 1
         val byteRegionOffsetIdxBegin = subByteTagSelectIdxEnd + 1
-        val byteRegionOffsetIdxEnd = coreMaxAddrBits - 1 - subByteTagSelectIdxEnd
+        val byteRegionOffsetIdxEnd = coreMaxAddrBits - subByteTagSelectIdxEnd - 1
 
         tspa.bits.subByteTagSelect := address(subByteTagSelectIdxEnd, subByteTagSelectIdxBegin)
         
@@ -321,11 +322,12 @@ class BoomNonBlockingTCacheModule(
     val mshrsIO = Wire(Vec(tcacheParams.nMSHRs, new TCacheMSHRIO()(p, tcacheParams)))
     val mshrs = for (i <- 0 until tcacheParams.nMSHRs) yield {
         val mshr = Module(new TCacheMSHRModule(tcacheParams))
-        val dcIF = Module(new SimpleHellaCacheIF)
-        io.mem(i) <> dcIF.io.cache
+        // val dcIF = Module(new SimpleHellaCacheIF)
+        // io.mem(i) <> dcIF.io.cache
         mshrsIO(i) <> mshr.io
+        // dcIF.io.requestor <> mshrsIO(i).mem
 
-        dcIF.io.requestor <> mshrsIO(i).mem
+        mshrsIO(i).mem <> io.mem(i)
         mshrsIO(i).exception := io.core.exception
         mshrsIO(i).brupdate := io.core.brupdate
         mshr
@@ -492,7 +494,7 @@ class BoomNonBlockingTCacheModule(
 
     when (s0_op_valid) {
         assert(s0_is_executing_replay ^ io.lsu.req.fire, "Arbiter drew from two sources?")
-        printf("[tcache] decoded tag storage address -> %x (sel=%x) uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d\n", s0_op.address.bits.address, s0_op.address.bits.subByteTagSelect, s0_op.uop.uses_ldq, s0_op.uop.ldq_idx, s0_op.uop.uses_stq, s0_op.uop.stq_idx)
+        printf("[tcache] decoded tag storage address -> %x (sel=%x) uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d. type=%d, data=%x\n", s0_op.address.bits.address, s0_op.address.bits.subByteTagSelect, s0_op.uop.uses_ldq, s0_op.uop.ldq_idx, s0_op.uop.uses_stq, s0_op.uop.stq_idx, s0_op.requestType.asUInt, s0_op.data)
     }
 
     /* ~* Stage 1 *~ */
@@ -571,10 +573,14 @@ class BoomNonBlockingTCacheModule(
     already very high risk component. 
     */
     val s1_hazard_blocked = s1_s2_op_valid && s1_s2_op.address.valid && 
+                            /* Hazards are caused by ops which write to the array */
                             (s1_s2_op.requestType === TCacheRequestTypeEnum.WRITE ||
-                             TCacheRequestTypeEnum.is_replay(s1_s2_op.requestType))
+                             TCacheRequestTypeEnum.is_replay(s1_s2_op.requestType)) &&
+                             /* We only have a hazard if they targeted the same record as us */
+                             s1_s2_op.address.bits.addressIndex === s1_op.address.bits.addressIndex
     val s1_nack = (s1_needs_miss && !available_mshr.req_op.ready) || 
-                    s1_mshr_blocked
+                    s1_mshr_blocked ||
+                    s1_hazard_blocked
     
     // The index to read to get the data for the hit way
     val s1_hit_data_array_idx = 
@@ -636,6 +642,9 @@ class BoomNonBlockingTCacheModule(
         s1_meta_wdata,
         s1_meta_wmask
     )
+    dontTouch(s1_op.address.bits.addressIndex)
+    dontTouch(s1_meta_wdata)
+    dontTouch(s1_meta_wmask)
 
     /* Handle writebacks */
     val s1_replay_writeback_meta_e = s1_meta_read_value(s1_victim_way_idx.bits)
@@ -651,7 +660,7 @@ class BoomNonBlockingTCacheModule(
 
     /* Drive the data array read port for S2 */
     val s1_data_array_enable = Wire(Bool())
-    val s1_data_array_idx = Wire(UInt(dataArraysEntries.W))
+    val s1_data_array_idx = Wire(UInt(log2Ceil(dataArraysEntries).W))
     s1_data_array_enable := false.B
     s1_data_array_idx := DontCare
     when (s1_op_valid) {
@@ -699,6 +708,8 @@ class BoomNonBlockingTCacheModule(
         to get the data, so we're fine.
         */
         req_b.data := DontCare
+        printf("[tcache] s1_writeback address=%x, way=%d. Evicted because address=%x\n", req_b.address.bits.address, s1_victim_way_idx.bits, s1_op.address.bits.address)
+
     } .elsewhen (s1_needs_miss && !s1_nack) {
         assert(available_mshr.req_op.ready, "A request was not nack'd even though no MSHR is available?")
         /* 
@@ -724,6 +735,7 @@ class BoomNonBlockingTCacheModule(
     val s2_hit = RegNext(s1_hit)
     val s2_nack = RegNext(s1_nack)
     val s2_way_hit_idx = RegNext(s1_way_hit_idx)
+    val s2_victim_way_idx = RegNext(s1_victim_way_idx)
     val s2_debug_needs_miss = RegNext(s1_needs_miss)
 
     s1_s2_op_valid := s2_op_valid
@@ -812,6 +824,10 @@ class BoomNonBlockingTCacheModule(
         Early acks are helpful because it saves clients from needing to wait for
         a possibly very long miss.
         */
+        printf("[tcache] s2 write ack addr=%x, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d (hit=%d, data=%x)\n",
+            s2_op.address.bits.address, s2_op.uop.uses_ldq, s2_op.uop.ldq_idx, s2_op.uop.uses_stq, s2_op.uop.stq_idx,
+            s2_hit,
+            s2_op.data)
         resp_v := true.B
         resp_b.nack := s2_nack
         resp_b.data := DontCare
@@ -821,6 +837,10 @@ class BoomNonBlockingTCacheModule(
         Write replay response
         Writes are early ack'd and so write replays don't need to respond.
         */
+        printf("[tcache] s2 replay write addr=%x, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d (hit=%d, data=%x)\n",
+            s2_op.address.bits.address, s2_op.uop.uses_ldq, s2_op.uop.ldq_idx, s2_op.uop.uses_stq, s2_op.uop.stq_idx,
+            s2_hit,
+            s2_op.data)
         resp_v := false.B
         resp_b.nack := DontCare
         resp_b.data := DontCare
@@ -829,7 +849,11 @@ class BoomNonBlockingTCacheModule(
     }
 
     /* Handle data writes */
-    val s2_data_widx = Cat(s2_op.address.bits.addressIndex, s2_way_hit_idx)
+    // The victim way takes priority over the hit since when we have a victim
+    // we are always going to be writing to that way (replay)
+    assert(!s2_victim_way_idx.valid || s2_victim_way_idx.valid && TCacheRequestTypeEnum.is_replay(s2_op_type), "Victim for non-replay?")
+    val s2_data_wway_idx = Mux(s2_victim_way_idx.valid, s2_victim_way_idx.bits, s2_way_hit_idx)
+    val s2_data_widx = Cat(s2_op.address.bits.addressIndex, s2_data_wway_idx)
     val s2_data_wmask = Wire(Vec(mteTagsPerBlock, Bool()))
     val s2_data_wdata = Wire(dataArrays.t)
     // Reshape the request to be a vector like the array
@@ -855,6 +879,9 @@ class BoomNonBlockingTCacheModule(
         s2_data_wdata := DontCare
     }
 
+    dontTouch(s2_data_widx)
+    dontTouch(s2_data_wdata)
+    dontTouch(s2_data_wmask)
     dataArrays.write(
         s2_data_widx,
         s2_data_wdata,
@@ -885,6 +912,106 @@ class TCacheMSHRIO(implicit p: Parameters, tcacheParams: TCacheParams)
     val blocked_address = Valid(UInt(coreMaxAddrBits.W))
 }
 
+object TCacheMSHRState extends ChiselEnum {
+    /** Ready to accept a new request */
+    val READY = Value
+    /** Waiting for downstream memory be ready to accept a request */
+    val MEMORY_REQUEST_WAIT = Value
+    /** Waiting for downstream memory to respond to an issued request */
+    val MEMORY_RESPONSE_WAIT = Value
+    /** Request is completed, waiting for TCache to drain the MSHR */
+    val TCACHE_WAIT = Value
+}
+
+// class TCacheMSHRModule2(
+//     val tcacheParams: TCacheParams
+// )(implicit p: Parameters) extends TCacheModule()(p, tcacheParams)
+//     with freechips.rocketchip.rocket.constants.MemoryOpConstants {
+//     val io = IO(new TCacheMSHRIO()(p, tcacheParams))
+    
+//     val next_state = Wire(TCacheMSHRState())
+//     val state = RegInit(TCacheMSHRState.READY)
+//     state := next_state
+
+//     val op_r = RegInit({
+//         val op_i = Wire(Valid(new TCacheOperation()(p, tcacheParams)))
+//         op_i.valid := false.B
+//         op_i.bits := DontCare
+//         op_i
+//     })
+//     val op = Wire(Valid(new TCacheOperation))
+//     // val op = Mux(state === TCacheMSHRState.READY, io.req_op.bits, op_r.bits)
+//     // val op_v = Wire(Bool())
+//     val op_v = !(state === TCacheMSHRState.READY && next_state === TCacheMSHRState.READY) &&
+//         !IsKilledByBranch(io.brupdate, op.uop) &&
+//         !(io.exception && op.requestType === TCacheRequestTypeEnum.READ)
+//     dontTouch(io.req_op.bits.uop)
+
+//     val s1_data_r = Reg(Valid(UInt((tcacheParams.blockSizeBytes * 8).W)))
+//     /* 
+//     We only serve from the latched data if we had to stall the write and thus
+//     had time to latch it
+//     */
+//     val s1_data = Mux(s1_data_r.valid, s1_data_r.bits, io.s1_data)
+
+//     val blocked_address_r = Reg(UInt(coreMaxAddrBits.W))
+//     io.blocked_address.bits := blocked_address_r
+//     /* 
+//     The request that we're blocked on is only valid when processing a request 
+//     */
+//     io.blocked_address.valid := (state === TCacheMSHRState.READY)
+
+//     /* Generate the next state */
+//     when (state === TCacheMSHRState.READY) {
+//         when (io.req_op.fire) {
+//             /* New request coming in! */
+//             when (io.mem.req.fire) {
+//                 /* We fired comb., wait for response */
+//                 next_state := TCacheMSHRState.MEMORY_RESPONSE_WAIT
+//             } .otherwise {
+//                 /* We didn't manage to fire to memory, try again next cycle */
+//                 next_state := TCacheMSHRState.MEMORY_REQUEST_WAIT
+//             }
+//         } .otherwise {
+//             /* No new request, so we're still ready */
+//             next_state := TCacheMSHRState.READY
+//         }
+//     } .elsewhen(state === TCacheMSHRState.MEMORY_REQUEST_WAIT) {
+//         /* This state retries firing to memory */
+//         when (io.mem.req.fire) {
+//             /* We fired, wait for response */
+//             next_state := TCacheMSHRState.MEMORY_RESPONSE_WAIT
+//         } .otherwise {
+//             /* We didn't manage to fire to memory, try again next cycle */
+//             next_state := TCacheMSHRState.MEMORY_REQUEST_WAIT
+//         }
+//     } .elsewhen (state === TCacheMSHRState.MEMORY_RESPONSE_WAIT) {
+//         when (io.mem.resp.valid) {
+//             when (io.resp_op.fire) {
+//                 /* 
+//                 We short circuit returned the response to the TCache, ready to
+//                 accept a new request
+//                 */
+//             next_state := TCacheMSHRState.READY
+//             } .otherwise {
+//                 /* TCache wasn't ready for us, go to wait */
+//                 next_state := TCacheMSHRState.TCACHE_WAIT
+//             }
+//         } .otherwise {
+//             /* Nothing came :( Wait forlornly by the mailbox */
+//             next_state := TCacheMSHRState.MEMORY_RESPONSE_WAIT
+//         }
+//     } .otherwise {
+//         next_state := DontCare
+//         assert(false.B, "state is impossible")
+//     }
+
+//     /* Manage the internal operation fastpaths */
+//     when (state === TCacheMSHRState.READY) {
+//        when (next_state =/= )
+//     }
+
+// }
 class TCacheMSHRModule(
     val tcacheParams: TCacheParams
 )(implicit p: Parameters) extends TCacheModule()(p, tcacheParams)
@@ -933,27 +1060,27 @@ class TCacheMSHRModule(
     cycles after (so op_r.valid is equiv to "is S1 or later").
     s1_data.valid is equiv to "is S2 or later" as it is set in S1.
     */
-    val s1_data_valid = op_r.valid
     val s1_data = Mux(s1_data_r.valid, s1_data_r.bits, io.s1_data)
     when (!s1_data_r.valid) {
         s1_data_r.valid := true.B
         s1_data_r.bits := io.s1_data
     }
+    dontTouch(s1_data_r)
     
-    //TODO: Support brupdate
-    //TODO: Support writes
-
     val op = Mux(io.req_op.fire, io.req_op.bits, op_r.bits)
     val op_address = op.address
     val op_type = op.requestType
     val op_v = Mux(io.req_op.fire, io.req_op.valid, op_r.valid) &&
         !IsKilledByBranch(io.brupdate, op.uop) &&
         !(io.exception && op.requestType === TCacheRequestTypeEnum.READ)
-    val executed = Mux(io.req_op.fire, false.B, executed_r)
+    val executed = Mux(io.req_op.fire, false.B, executed_r && !io.mem.s2_nack)
     
     op_r.valid := op_v &&
                     /* Invalidate after we fire the response */
-                    !io.resp_op.fire
+                    !io.resp_op.fire &&
+                    /* Invalidate writeback requests on write ACK */
+                    (op.requestType =/= TCacheRequestTypeEnum.WRITEBACK ||
+                            !io.mem.resp.valid)
     op_r.bits.uop.br_mask := GetNewBrMask(io.brupdate, op.uop)
     io.blocked_address.valid := op_r.valid
 
@@ -964,6 +1091,7 @@ class TCacheMSHRModule(
 
     io.mem.s1_kill := false.B
     io.mem.s2_kill := false.B
+    io.mem.req.bits.data := 0xaaadead.U
     io.mem.s1_data.data := s1_data
     io.mem.s1_data.mask := Fill(coreDataBytes, 1.U(1.W))
     req_v := false.B
@@ -982,6 +1110,7 @@ class TCacheMSHRModule(
     req_b.addr := masked_addr
     blocked_address_r := masked_addr
 
+    /* Try to fire memory requests and retries */
     when (op_v && !executed) {
         when (op_type === TCacheRequestTypeEnum.READ ||
               op_type === TCacheRequestTypeEnum.WRITE) {
@@ -997,6 +1126,14 @@ class TCacheMSHRModule(
         }
     }
 
+    when (op_v && io.mem.s2_nack) {
+        printf("[mshr] s2_nack req, retrying addr=%x, cmd=%x\n", io.mem.req.bits.addr, io.mem.req.bits.cmd)
+        // Set executed to false on nack so we retry
+        // If we retry this cycle (executed includes nack), the next block
+        // will override this write and make it true.
+        executed_r := false.B
+    }
+
     when (op_v && io.mem.req.fire) {
         printf("[mshr] firing req addr=%x, cmd=%x\n", io.mem.req.bits.addr, io.mem.req.bits.cmd)
         executed_r := true.B
@@ -1004,20 +1141,23 @@ class TCacheMSHRModule(
     }
 
     /* ~* Handle memory response *~ */
+    val resp_op_v_r = Reg(Bool())
     val resp_mem_v = io.mem.resp.valid
-    val should_send_resp = op_r.valid && op_r.bits.requestType =/= TCacheRequestTypeEnum.WRITEBACK
+    val should_send_resp = op_r.valid && 
+        op_r.bits.requestType =/= TCacheRequestTypeEnum.WRITEBACK &&
+        (resp_mem_v || resp_op_v_r) &&
+        !IsKilledByBranch(io.brupdate, op_r.bits.uop) &&
+        !(io.exception && op_r.bits.requestType === TCacheRequestTypeEnum.READ)
+        
     val resp_mem_b = io.mem.resp.bits
 
     val resp_line_r = Reg(UInt(tcacheParams.blockSizeBytes.W))
     val resp_line = Mux(resp_mem_v, resp_mem_b.data, resp_line_r)
-    val resp_op_v_r = Reg(Bool())
 
     val resp_op_b = io.resp_op.bits
     // We use op_r here rather than op_v to break the combinational loop
     // we don't need op_v anyways since we'll never be valid in cycle 0
-    io.resp_op.valid := should_send_resp && (resp_mem_v || resp_op_v_r) &&
-        !IsKilledByBranch(io.brupdate, op_r.bits.uop) &&
-        !(io.exception && op_r.bits.requestType === TCacheRequestTypeEnum.READ)
+    io.resp_op.valid := should_send_resp
     resp_op_b := op_r.bits
     resp_op_b.uop.br_mask := GetNewBrMask(io.brupdate, op_r.bits.uop)
     when (op_r.bits.requestType === TCacheRequestTypeEnum.READ) {
@@ -1048,9 +1188,14 @@ class TCacheMSHRModule(
         resp_op_b.data := resp_line
     }
 
+    /*
+    Since an operation may be killed at any time, we need to invalidate the op
+    but if we've already launched the request we need to be sure that we 
+    correctly catch it so that we don't effectively have a use after free.
+    */
     assert(!(resp_mem_v && io.req_op.ready), "Memory arrived while MSHR deallocated?")
-    when (op_r.valid && resp_mem_v) {
-        printf("[mshr] fetched addr=%x, data=%x\n", op_address.bits.address, resp_line)
+    when (resp_mem_v) {
+        printf("[mshr] fetched addr=%x, data=%x, request_alive=%d\n", op_address.bits.address, resp_line, op_r.valid)
         resp_line_r := resp_mem_b.data
         resp_op_v_r := should_send_resp
         memory_executing := false.B
