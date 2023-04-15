@@ -128,6 +128,17 @@ object TCacheRequestTypeEnum extends ChiselEnum {
         v === REPLAY_READ || 
         v === REPLAY_WRITE
     }
+
+    /**
+      * Can this type of request be killed by a mispredict or exception?
+      * The LSU will speculatively launch reads which may be killed but other
+      * things, like writes or writebacks, are either only launched after 
+      * commit or are purely internal.
+      */
+    def is_killable(v:TCacheRequestTypeEnum.Type) = {
+        v === REPLAY_READ ||
+        v === REPLAY_WRITE
+    }
 }
 
 class NormalPhysicalAddress(implicit p: Parameters, tcacheParams: TCacheParams)
@@ -277,6 +288,8 @@ class TCacheLSUIO(implicit p: Parameters, tcacheParams: TCacheParams)
     /** For requests that require a response, this is where it comes out */
     val resp = Valid(new TCacheResponse)
 
+    val st_exc_killed_mask = Flipped(Vec(numStqEntries, Bool()))
+
     // /** 
     //  * The TCache's access port (possibly arbitrated) to the next level 
     //  * Boom DCache
@@ -330,6 +343,7 @@ class BoomNonBlockingTCacheModule(
         mshrsIO(i).mem <> io.mem(i)
         mshrsIO(i).exception := io.core.exception
         mshrsIO(i).brupdate := io.core.brupdate
+        mshrsIO(i).st_exc_killed_mask := io.lsu.st_exc_killed_mask
         mshr
     }
 
@@ -503,7 +517,9 @@ class BoomNonBlockingTCacheModule(
     s1_op.uop.br_mask := GetNewBrMask(io.core.brupdate, s0_op.uop)
     val s1_op_valid = RegNext(s0_op_valid && 
         !IsKilledByBranch(io.core.brupdate, s0_op.uop) &&
-        !(io.core.exception && s0_op.requestType === TCacheRequestTypeEnum.READ))
+        !(io.core.exception && s0_op.uop.uses_ldq) &&
+        !(s0_op.uop.uses_stq && io.lsu.st_exc_killed_mask(s0_op.uop.stq_idx))
+    )
     val s1_meta_read_value = Wire(Vec(tcacheParams.nWays, metaT))
     /* 
     forward declared wires for hazard detection. We need these otherwise we get
@@ -719,7 +735,8 @@ class BoomNonBlockingTCacheModule(
         val uop = s1_op.uop
         available_mshr.req_op.valid := 
             !IsKilledByBranch(io.core.brupdate, uop) &&
-            !(io.core.exception && s1_op.requestType === TCacheRequestTypeEnum.READ)
+            !(io.core.exception && s1_op.uop.uses_ldq) &&
+            !(s1_op.uop.uses_stq && io.lsu.st_exc_killed_mask(s1_op.uop.stq_idx))
         available_mshr.req_op.bits := s1_op
         available_mshr.req_op.bits.uop.br_mask := GetNewBrMask(io.core.brupdate, uop)
     }
@@ -730,7 +747,9 @@ class BoomNonBlockingTCacheModule(
     s2_op.uop.br_mask := GetNewBrMask(io.core.brupdate, s1_op.uop)
     val s2_op_valid = RegNext(s1_op_valid && 
         !IsKilledByBranch(io.core.brupdate, s1_op.uop) &&
-        !(io.core.exception && s1_op.requestType === TCacheRequestTypeEnum.READ))
+        !(io.core.exception && s1_op.uop.uses_ldq) &&
+        !(s1_op.uop.uses_stq && io.lsu.st_exc_killed_mask(s1_op.uop.stq_idx))
+    )
     val s2_op_type = s2_op.requestType
     val s2_hit = RegNext(s1_hit)
     val s2_nack = RegNext(s1_nack)
@@ -909,6 +928,8 @@ class TCacheMSHRIO(implicit p: Parameters, tcacheParams: TCacheParams)
 
     val brupdate = Input(new BrUpdateInfo)
     val exception = Input(Bool())
+    val st_exc_killed_mask = Flipped(Vec(numStqEntries, Bool()))
+
     val blocked_address = Valid(UInt(coreMaxAddrBits.W))
 }
 
@@ -1072,7 +1093,8 @@ class TCacheMSHRModule(
     val op_type = op.requestType
     val op_v = Mux(io.req_op.fire, io.req_op.valid, op_r.valid) &&
         !IsKilledByBranch(io.brupdate, op.uop) &&
-        !(io.exception && op.requestType === TCacheRequestTypeEnum.READ)
+        !(io.exception && op.uop.uses_ldq) &&
+        !(op.uop.uses_stq && io.st_exc_killed_mask(op.uop.stq_idx))
     val executed = Mux(io.req_op.fire, false.B, executed_r && !io.mem.s2_nack)
     
     op_r.valid := op_v &&
@@ -1126,12 +1148,13 @@ class TCacheMSHRModule(
         }
     }
 
-    when (op_v && io.mem.s2_nack) {
-        printf("[mshr] s2_nack req, retrying addr=%x, cmd=%x\n", io.mem.req.bits.addr, io.mem.req.bits.cmd)
+    when (io.mem.s2_nack) {
+        printf("[mshr] s2_nack req, retrying addr=%x, cmd=%x, alive=%d\n", io.mem.req.bits.addr, io.mem.req.bits.cmd, op_v)
         // Set executed to false on nack so we retry
         // If we retry this cycle (executed includes nack), the next block
         // will override this write and make it true.
         executed_r := false.B
+        memory_executing := false.B
     }
 
     when (op_v && io.mem.req.fire) {
@@ -1147,7 +1170,8 @@ class TCacheMSHRModule(
         op_r.bits.requestType =/= TCacheRequestTypeEnum.WRITEBACK &&
         (resp_mem_v || resp_op_v_r) &&
         !IsKilledByBranch(io.brupdate, op_r.bits.uop) &&
-        !(io.exception && op_r.bits.requestType === TCacheRequestTypeEnum.READ)
+        !(io.exception && op_r.bits.uop.uses_ldq) &&
+        !(op_r.bits.uop.uses_stq && io.st_exc_killed_mask(op_r.bits.uop.stq_idx))
         
     val resp_mem_b = io.mem.resp.bits
 
