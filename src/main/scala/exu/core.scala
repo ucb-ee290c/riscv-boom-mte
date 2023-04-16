@@ -332,6 +332,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   dontTouch(debug_tsc_reg)
   dontTouch(debug_irt_reg)
 
+  if (useMTE) {
+    io.tcache.tsc_reg := debug_tsc_reg
+  }
+
   //****************************************
   // Print-out information about the machine
 

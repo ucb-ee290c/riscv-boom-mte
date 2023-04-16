@@ -305,6 +305,7 @@ class TCacheCoreIO(implicit p: Parameters) extends BoomBundle()(p) {
     val mtePermissiveTag = Input(UInt(width = MTEConfig.tagBits.W))
     val brupdate = Input(new BrUpdateInfo)
     val exception = Input(Bool())
+    val tsc_reg     = Input(UInt())
 }
 
 class TCacheIO(implicit p: Parameters, tcacheParams: TCacheParams) 
@@ -343,6 +344,7 @@ class BoomNonBlockingTCacheModule(
         mshrsIO(i).mem <> io.mem(i)
         mshrsIO(i).exception := io.core.exception
         mshrsIO(i).brupdate := io.core.brupdate
+        mshrsIO(i).tsc_reg := io.core.tsc_reg
         mshrsIO(i).st_exc_killed_mask := io.lsu.st_exc_killed_mask
         mshr
     }
@@ -381,7 +383,7 @@ class BoomNonBlockingTCacheModule(
     io.lsu.req.ready := !s0_is_executing_replay
 
     when (io.lsu.req.fire) {
-        printf("[tcache] accepted request for addr=0x%x, op=%d\n", io.lsu.req.bits.address, io.lsu.req.bits.requestType.asUInt)
+        printf("[tcache] accepted request for addr=0x%x, op=%d [tsc=%d]\n", io.lsu.req.bits.address, io.lsu.req.bits.requestType.asUInt, io.core.tsc_reg)
     }
 
     /*
@@ -500,7 +502,7 @@ class BoomNonBlockingTCacheModule(
         completed_mshr.resp_op.ready := true.B
         s0_op := completed_mshr.resp_op.bits
         s0_op_valid := true.B
-        printf("[tcache] executing replay\n")
+        printf("[tcache] executing replay [tsc=%d]\n", io.core.tsc_reg)
     } .otherwise {
         s0_op := s0_incoming_op
         s0_op_valid := s0_incoming_op_valid
@@ -508,7 +510,7 @@ class BoomNonBlockingTCacheModule(
 
     when (s0_op_valid) {
         assert(s0_is_executing_replay ^ io.lsu.req.fire, "Arbiter drew from two sources?")
-        printf("[tcache] decoded tag storage address -> %x (sel=%x) uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d. type=%d, data=%x\n", s0_op.address.bits.address, s0_op.address.bits.subByteTagSelect, s0_op.uop.uses_ldq, s0_op.uop.ldq_idx, s0_op.uop.uses_stq, s0_op.uop.stq_idx, s0_op.requestType.asUInt, s0_op.data)
+        printf("[tcache] decoded tag storage address -> %x (sel=%x) uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d. type=%d, data=%x [tsc=%d]\n", s0_op.address.bits.address, s0_op.address.bits.subByteTagSelect, s0_op.uop.uses_ldq, s0_op.uop.ldq_idx, s0_op.uop.uses_stq, s0_op.uop.stq_idx, s0_op.requestType.asUInt, s0_op.data, io.core.tsc_reg)
     }
 
     /* ~* Stage 1 *~ */
@@ -555,7 +557,7 @@ class BoomNonBlockingTCacheModule(
     )
     val s1_hit = s1_way_hit_map.reduce(_ || _)
 
-    assert(s1_hit && !s1_mshr_blocked || !s1_hit, "Hit in cache but there is an outstanding MSHR for the same line...")
+    assert(!s1_op_valid || (s1_hit && !s1_mshr_blocked || !s1_hit), "Hit in cache but there is an outstanding MSHR for the same line...")
 
     var s1_debug_has_hit = false.B
     s1_way_hit_map.foreach { hit =>
@@ -569,7 +571,7 @@ class BoomNonBlockingTCacheModule(
     actively missed out line), we should never have a case where a replay finds
     its data is already in the cache
     */
-    assert(!TCacheRequestTypeEnum.is_replay(s1_op.requestType) || !s1_hit, "Attempting to execute replay when line is not missing")
+    assert(!s1_op_valid || (!TCacheRequestTypeEnum.is_replay(s1_op.requestType) || !s1_hit), "Attempting to execute replay when line is not missing")
 
     val s1_needs_miss = s1_op_valid && s1_op.address.valid && !s1_hit && 
                         (s1_op.requestType === TCacheRequestTypeEnum.READ || 
@@ -724,7 +726,7 @@ class BoomNonBlockingTCacheModule(
         to get the data, so we're fine.
         */
         req_b.data := DontCare
-        printf("[tcache] s1_writeback address=%x, way=%d. Evicted because address=%x\n", req_b.address.bits.address, s1_victim_way_idx.bits, s1_op.address.bits.address)
+        printf("[tcache] s1_writeback address=%x, way=%d. Evicted because address=%x [tsc=%d]\n", req_b.address.bits.address, s1_victim_way_idx.bits, s1_op.address.bits.address, io.core.tsc_reg)
 
     } .elsewhen (s1_needs_miss && !s1_nack) {
         assert(available_mshr.req_op.ready, "A request was not nack'd even though no MSHR is available?")
@@ -796,7 +798,7 @@ class BoomNonBlockingTCacheModule(
             we launched a request for a region not covered by MTE. In this case,
             we simply return the permissive tag
             */
-	        printf("[tache] s2 resp default = uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d\n", s2_op.uop.uses_ldq, s2_op.uop.ldq_idx, s2_op.uop.uses_stq, s2_op.uop.stq_idx) 
+	        printf("[tache] s2 resp default = uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d [tsc=%d]\n", s2_op.uop.uses_ldq, s2_op.uop.ldq_idx, s2_op.uop.uses_stq, s2_op.uop.stq_idx, io.core.tsc_reg) 
             resp_v := true.B
             resp_b.data := io.core.mtePermissiveTag
             resp_b.nack := false.B
@@ -807,7 +809,7 @@ class BoomNonBlockingTCacheModule(
             failed.
             */
             assert(s2_hit || s2_debug_needs_miss, "S2 read miss but no miss was fired in S1")
-            printf("[tcache] s2 read hit=%d, nack=%d, addr=%x, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d\n", s2_hit, s2_nack, s2_op.address.bits.address, s2_op.uop.uses_ldq, s2_op.uop.ldq_idx, s2_op.uop.uses_stq, s2_op.uop.stq_idx)
+            printf("[tcache] s2 read hit=%d, nack=%d, addr=%x, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d [tsc=%d]\n", s2_hit, s2_nack, s2_op.address.bits.address, s2_op.uop.uses_ldq, s2_op.uop.ldq_idx, s2_op.uop.uses_stq, s2_op.uop.stq_idx, io.core.tsc_reg)
             resp_v := s2_hit || s2_nack
             resp_b.nack := s2_nack 
 
@@ -821,7 +823,7 @@ class BoomNonBlockingTCacheModule(
         writeback data.
         Replays cannot NACK, so these responses are always valid.
         */
-        printf("[tcache] s2 replay read addr=%x, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d\n", s2_op.address.bits.address, s2_op.uop.uses_ldq, s2_op.uop.ldq_idx, s2_op.uop.uses_stq, s2_op.uop.stq_idx)
+        printf("[tcache] s2 replay read addr=%x, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d [tsc=%d]\n", s2_op.address.bits.address, s2_op.uop.uses_ldq, s2_op.uop.ldq_idx, s2_op.uop.uses_stq, s2_op.uop.stq_idx, io.core.tsc_reg)
         
         resp_v := true.B
         resp_b.nack := false.B
@@ -843,10 +845,12 @@ class BoomNonBlockingTCacheModule(
         Early acks are helpful because it saves clients from needing to wait for
         a possibly very long miss.
         */
-        printf("[tcache] s2 write ack addr=%x, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d (hit=%d, data=%x)\n",
+        printf("[tcache] s2 write ack addr=%x, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d (hit=%d, data=%x) [tsc=%d]\n",
             s2_op.address.bits.address, s2_op.uop.uses_ldq, s2_op.uop.ldq_idx, s2_op.uop.uses_stq, s2_op.uop.stq_idx,
             s2_hit,
-            s2_op.data)
+            s2_op.data,
+            io.core.tsc_reg
+        )
         resp_v := true.B
         resp_b.nack := s2_nack
         resp_b.data := DontCare
@@ -856,10 +860,12 @@ class BoomNonBlockingTCacheModule(
         Write replay response
         Writes are early ack'd and so write replays don't need to respond.
         */
-        printf("[tcache] s2 replay write addr=%x, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d (hit=%d, data=%x)\n",
+        printf("[tcache] s2 replay write addr=%x, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d (hit=%d, data=%x) [tsc=%d]\n",
             s2_op.address.bits.address, s2_op.uop.uses_ldq, s2_op.uop.ldq_idx, s2_op.uop.uses_stq, s2_op.uop.stq_idx,
             s2_hit,
-            s2_op.data)
+            s2_op.data,
+            io.core.tsc_reg
+        )
         resp_v := false.B
         resp_b.nack := DontCare
         resp_b.data := DontCare
@@ -929,6 +935,7 @@ class TCacheMSHRIO(implicit p: Parameters, tcacheParams: TCacheParams)
     val brupdate = Input(new BrUpdateInfo)
     val exception = Input(Bool())
     val st_exc_killed_mask = Flipped(Vec(numStqEntries, Bool()))
+    val tsc_reg = Input(UInt())
 
     val blocked_address = Valid(UInt(coreMaxAddrBits.W))
 }
@@ -1065,7 +1072,7 @@ class TCacheMSHRModule(
     when (io.req_op.fire) {
     	assert(io.req_op.valid && io.req_op.bits.address.valid, "MSHR was fired an invalid op?")
         assert(!TCacheRequestTypeEnum.is_replay(io.req_op.bits.requestType), "MSHR was fired a replay?")
-        printf("[mshr] accepted new op, addr=%x, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d\n", io.req_op.bits.address.bits.address, io.req_op.bits.uop.uses_ldq, io.req_op.bits.uop.ldq_idx, io.req_op.bits.uop.uses_stq, io.req_op.bits.uop.stq_idx)
+        printf("[mshr] accepted new op, addr=%x, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d [tsc=%d]\n", io.req_op.bits.address.bits.address, io.req_op.bits.uop.uses_ldq, io.req_op.bits.uop.ldq_idx, io.req_op.bits.uop.uses_stq, io.req_op.bits.uop.stq_idx, io.tsc_reg)
 
         op_r.bits := io.req_op.bits
         executed_r := false.B
@@ -1149,7 +1156,7 @@ class TCacheMSHRModule(
     }
 
     when (io.mem.s2_nack) {
-        printf("[mshr] s2_nack req, retrying addr=%x, cmd=%x, alive=%d\n", io.mem.req.bits.addr, io.mem.req.bits.cmd, op_v)
+        printf("[mshr] s2_nack req, retrying addr=%x, cmd=%x, alive=%d, [tsc=%d]\n", io.mem.req.bits.addr, io.mem.req.bits.cmd, op_v, io.tsc_reg)
         // Set executed to false on nack so we retry
         // If we retry this cycle (executed includes nack), the next block
         // will override this write and make it true.
@@ -1158,7 +1165,7 @@ class TCacheMSHRModule(
     }
 
     when (op_v && io.mem.req.fire) {
-        printf("[mshr] firing req addr=%x, cmd=%x\n", io.mem.req.bits.addr, io.mem.req.bits.cmd)
+        printf("[mshr] firing req addr=%x, cmd=%x [tsc=%d]\n", io.mem.req.bits.addr, io.mem.req.bits.cmd, io.tsc_reg)
         executed_r := true.B
         memory_executing := true.B
     }
@@ -1219,7 +1226,7 @@ class TCacheMSHRModule(
     */
     assert(!(resp_mem_v && io.req_op.ready), "Memory arrived while MSHR deallocated?")
     when (resp_mem_v) {
-        printf("[mshr] fetched addr=%x, data=%x, request_alive=%d\n", op_address.bits.address, resp_line, op_r.valid)
+        printf("[mshr] fetched addr=%x, data=%x, request_alive=%d [tsc=%d]\n", op_address.bits.address, resp_line, op_r.valid, io.tsc_reg)
         resp_line_r := resp_mem_b.data
         resp_op_v_r := should_send_resp
         memory_executing := false.B
