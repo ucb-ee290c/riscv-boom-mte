@@ -160,6 +160,14 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
     val release = Bool()
     val tlbMiss = Bool()
   })
+
+  // val mte_
+  // val mte_faCSR_wdata = useMTE.option(Output(UInt(xLen.W)))
+  // val mte_faCSR_wen   = useMTE.option(Output(Bool()))
+  // val mte_faCSR_wdata = useMTE.option(Output(UInt(xLen.W)))
+  // val mte_faCSR_wen   = useMTE.option(Output(Bool()))
+  // val mte_enabled = useMTE.option(Input(UInt(MTECSRs.smte_config_enableWidth.W)))
+  // val mte_permissive_tag = useMTE.option(Input(UInt(MTEConfig.tagBits.W)))
 }
 
 class LSUIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
@@ -193,7 +201,7 @@ class LDQEntry(implicit p: Parameters) extends BoomBundle()(p)
    * Note that this does not imply that tags have yet arrived, see the valid bit
    * on the phys_mte_tag.
    */
-  val phys_mte_tag_executed = useMTE.option(Bool()) //tag fetch sent to memory
+  val phys_mte_tag_pending = useMTE.option(Bool()) //tag fetch sent to memory but has not returned. Cleared on response.
   /**
     * Data has been received from dmem and transmitted back to the core
     * (i.e. this load has been released)
@@ -227,7 +235,9 @@ class STQEntry(implicit p: Parameters) extends BoomBundle()(p)
   val data                = Valid(UInt(xLen.W))
 
   val committed           = Bool() // committed by ROB
-  val phys_mte_tag_executed = useMTE.option(Bool()) //tag fetch sent to memory
+  val phys_mte_tag_pending = useMTE.option(Bool()) //tag fetch sent to memory but has not returned. Cleared on response.
+  val commit_in_flight    = Bool()
+
   val succeeded           = Bool() // D$ has ack'd this, we don't need to maintain this anymore
 
   val debug_wb_data       = UInt(xLen.W)
@@ -250,6 +260,25 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val stq_tail         = Reg(UInt(stqAddrSz.W))
   val stq_commit_head  = Reg(UInt(stqAddrSz.W)) // point to next store to commit
   val stq_execute_head = Reg(UInt(stqAddrSz.W)) // point to next store to execute
+  /*
+  0 for tcache
+  1 for dmem
+  */
+  val stq_execute_head_rewinds = Wire(Vec(2, Valid(UInt(stqAddrSz.W))))
+  for (i <- 0 until stq_execute_head_rewinds.length) {
+    stq_execute_head_rewinds(i).valid := false.B
+    stq_execute_head_rewinds(i).bits := DontCare
+  }
+
+
+  // def update_stq_execute_head_rewind(rewind:UInt) = {
+  //   when (!stq_execute_head_rewind_valid) {
+  //     stq_execute_head_rewind_valid = true.B
+  //     stq_execute_head_rewind_idx = rewind
+  //   } .elsewhen (IsOlder(rewind, stq_execute_head_rewind_idx, stq_head)) {
+  //     stq_execute_head_rewind_idx = rewind
+  //   }
+  // }
 
 
   // If we got a mispredict, the tail will be misaligned for 1 extra cycle
@@ -484,7 +513,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       TODO: Track this as a metric--is this actually true?
       */
       e.addr.valid && !e.addr_is_virtual && 
-        !e.phys_mte_tag_executed.get && !e.phys_mte_tag.get.valid
+        !e.phys_mte_tag_pending.get && !e.phys_mte_tag.get.valid
     }
   }
 
@@ -504,7 +533,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       Allow launch of valid entries if they've completed TLB and don't have a tag already.
       */
       e.addr.valid && !e.addr_is_virtual && 
-        !e.phys_mte_tag_executed.get && !e.phys_mte_tag.get.valid &&
+        !e.phys_mte_tag_pending.get && !e.phys_mte_tag.get.valid &&
         /* Do not fetch tags for tag write operations */
         !e.uop.is_mte_tag_write
     }
@@ -915,19 +944,19 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     for (i <- 0 until numLdqEntries) {
       val ldq_e = ldq(i)
       val ldq_b = ldq_e.bits
-      printf("[lsu] LD.Q %d, valid=%x, addr=%x (V=%d, virtual=%d), addr_mte_tag=%x, phys_mte_tag=%x (V=%d), executed=%d, phys_mte_tag_executed=%d, succeeded=%d, committed=%d, uopc=%d, pc=%x\n",
-        i.U, ldq_e.valid, ldq_b.addr.bits, ldq_b.addr.valid, ldq_b.addr_is_virtual, ldq_b.addr_mte_tag.get, ldq_b.phys_mte_tag.get.bits, ldq_b.phys_mte_tag.get.valid, ldq_b.executed, ldq_b.phys_mte_tag_executed.get, ldq_b.succeeded, ldq_b.committed, ldq_b.uop.uopc, ldq_b.uop.debug_pc)
+      printf("[lsu] LD.Q %d, valid=%x, addr=%x (V=%d, virtual=%d), addr_mte_tag=%x, phys_mte_tag=%x (V=%d), executed=%d, phys_mte_tag_pending=%d, succeeded=%d, committed=%d, uopc=%d, pc=%x\n",
+        i.U, ldq_e.valid, ldq_b.addr.bits, ldq_b.addr.valid, ldq_b.addr_is_virtual, ldq_b.addr_mte_tag.get, ldq_b.phys_mte_tag.get.bits, ldq_b.phys_mte_tag.get.valid, ldq_b.executed, ldq_b.phys_mte_tag_pending.get, ldq_b.succeeded, ldq_b.committed, ldq_b.uop.uopc, ldq_b.uop.debug_pc)
     }
     printf("[lsu] ---END\n")
   }
 
   def stq_dump() = {
-    printf("[lsu] ---STQ DUMP (tsc=%d)\nhead=%d, tail=%d, commit head=%d\n", io.core.tsc_reg, stq_head, stq_tail, stq_commit_head)
+    printf("[lsu] ---STQ DUMP (tsc=%d)\nhead=%d, tail=%d, commit head=%d, execute head=%d\n", io.core.tsc_reg, stq_head, stq_tail, stq_commit_head, stq_execute_head)
     for (i <- 0 until numStqEntries) {
       val stq_e = stq(i)
       val stq_b = stq_e.bits
-      printf("[lsu] ST.Q %d, valid=%x, addr=%x (V=%d, virtual=%d), addr_mte_tag=%x, phys_mte_tag=%x (V=%d), phys_mte_tag_executed=%d, succeeded=%d, committed=%d, uopc=%d, pc=%x\n",
-        i.U, stq_e.valid, stq_b.addr.bits, stq_b.addr.valid, stq_b.addr_is_virtual, stq_b.addr_mte_tag.get, stq_b.phys_mte_tag.get.bits, stq_b.phys_mte_tag.get.valid, stq_b.phys_mte_tag_executed.get, stq_b.succeeded, stq_b.committed, stq_b.uop.uopc, stq_b.uop.debug_pc)
+      printf("[lsu] ST.Q %d, valid=%x, addr=%x (V=%d, virtual=%d), addr_mte_tag=%x, phys_mte_tag=%x (V=%d), phys_mte_tag_pending=%d, commit_in_flight=%d, succeeded=%d, committed=%d, uopc=%d, pc=%x\n",
+        i.U, stq_e.valid, stq_b.addr.bits, stq_b.addr.valid, stq_b.addr_is_virtual, stq_b.addr_mte_tag.get, stq_b.phys_mte_tag.get.bits, stq_b.phys_mte_tag.get.valid, stq_b.phys_mte_tag_pending.get, stq_b.commit_in_flight, stq_b.succeeded, stq_b.committed, stq_b.uop.uopc, stq_b.uop.debug_pc)
     }
     printf("[lsu] ---END\n")
   }
@@ -990,6 +1019,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                        will_fire_stad_incoming (w) ||
                        will_fire_sta_incoming  (w))
 
+  val tcache_did_fire = Wire(Bool())
+  tcache_did_fire := false.B
   if (useMTE) {
     require(memWidth == 1, "Tag cache does not support width > 1")
     val tcacheIO = io.tcache.get
@@ -1046,44 +1077,51 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         val is_fence = tcache_uop(w).is_fence || tcache_uop(w).is_fencei
         val can_fire = req.ready && tcache_addr(w).valid && 
           !IsKilledByBranch(io.core.brupdate, tcache_uop(w)) &&
-          !is_fence
+          !is_fence &&
+          /*
+          Tag writes can only fire if they do not already have an in-flight/complete 
+          commit operation. We can end up in this situation if, say, dmem nacks
+          and we rewind but tcache continues okay.
+          */
+          (!tcache_uop(w).is_mte_tag_write || !(tcache_stq_e(w).bits.commit_in_flight || tcache_stq_e(w).bits.succeeded))
+
         reqB.uop := tcache_uop(w)
         reqB.uop.br_mask := GetNewBrMask(io.core.brupdate, tcache_uop(w).br_mask)
 
         /* If we're good to go, launch it! */
+        tcache_did_fire := can_fire
         req.valid := can_fire
         when (tcache_ldq_e(w).valid) {
           assert(!is_fence, "Fences should never travel down ldq")
 	        val e = ldq(tcache_uop(w).ldq_idx)
-          assert(tcache_is_incoming(w) || !e.bits.phys_mte_tag_executed.get, "Already executed?")
-	        printf("[lsu] LDQ %x, tcache_can_fire=%d, addr=%x [tsc=%d]\n", tcache_uop(w).ldq_idx, can_fire, reqB.address, io.core.tsc_reg)
-          e.bits.phys_mte_tag_executed.get := can_fire
+          assert(!e.bits.phys_mte_tag_pending.get, "Already executed?")
+          assert(!e.bits.phys_mte_tag.get.valid, "Trying to fire when tags already valid")
+	        printf("[lsu] LDQ %d, tcache_can_fire=%d, addr=%x [tsc=%d]\n", tcache_uop(w).ldq_idx, can_fire, reqB.address, io.core.tsc_reg)
+          e.bits.phys_mte_tag_pending.get := can_fire
 	        ldq_dump()
         } .elsewhen(tcache_stq_e(w).valid) {
 	        val e = stq(tcache_uop(w).stq_idx)
-          assert(tcache_is_incoming(w) || !e.bits.phys_mte_tag_executed.get ||
-                 /* tag writes replay until they land, no extra metadata */
-                 (tcache_uop(w).is_mte_tag_write && !e.bits.succeeded), "Already executed?")
 	        printf("[lsu] STQ %x, tcache_can_fire=%d, addr=%x, type=%d, data=%x [tsc=%d]\n", tcache_uop(w).stq_idx, can_fire, reqB.address, reqB.requestType.asUInt, reqB.data, io.core.tsc_reg)
-          e.bits.phys_mte_tag_executed.get := can_fire
 
           when (tcache_uop(w).is_mte_tag_write) {
-            /* Advance the store execute pointer if we're firing a commit */
-            stq_execute_head := Mux(can_fire,
-                                      WrapInc(stq_execute_head, numStqEntries),
-                                      stq_execute_head)
+            val already_launched = e.bits.commit_in_flight || e.bits.succeeded
+            /* Mark the commit in flight */
+            assert(can_fire ^ already_launched, "Attempting to re-execute an executed tag write")
+            when (can_fire) {
+              e.bits.commit_in_flight := true.B
+            }
+            when (can_fire || already_launched) {
+              /*
+              Speculatively advance the execute head if we fired or just step
+              over if we've already executed
+              */
+              stq_execute_head := WrapInc(stq_execute_head, numStqEntries)
+            }
+          } .otherwise {
+            assert(!e.bits.phys_mte_tag_pending.get, "Already executed?")
+            assert(!e.bits.phys_mte_tag.get.valid, "Trying to fire when tags already valid")
+            e.bits.phys_mte_tag_pending.get := can_fire
           }
-
-          // when (is_fence || tcache_uop(w).is_mte_tag_write) {
-          //   /* 
-          //   XXX: Fences and tag writes are not tagged operations.
-          //   Rather than fix this so that we're not lying about having tags, we
-          //   stuff dummy tags now so they don't block.
-          //   */
-          //   e.bits.phys_mte_tag_executed.get := true.B
-          //   e.bits.phys_mte_tag.get.valid := true.B
-          //   e.bits.phys_mte_tag.get.bits := 0xc.U
-          // }
 
 	        stq_dump()
         } /* otherwise should be unreachable, already asserted above */
@@ -1103,45 +1141,68 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         printf("[lsu] tcache response arrived LDQ %d, addr=%x, nack=%d, tag=%x [tsc=%d]\n", respB.uop.ldq_idx, ldq(respB.uop.ldq_idx).bits.addr.bits, respB.nack,respB.data, io.core.tsc_reg)
         val ldq_e = ldq(respB.uop.ldq_idx)
         assert(ldq_e.valid, "TCache response for invalid/freed entry")
-        assert(ldq_e.bits.phys_mte_tag_executed.get, "TCache response for non-executed entry")
-        assert(!ldq_e.bits.phys_mte_tag.get.valid, "TCache response attempting to overwrite valid tag")
+        assert(ldq_e.bits.phys_mte_tag_pending.get, "TCache response for non-executed entry")
 
-        /* If we were nack'd, clear executed so we replay */
-        ldq_e.bits.phys_mte_tag_executed.get := !respB.nack
+        /* Clear the pending bit since the request has arrived */
+        ldq_e.bits.phys_mte_tag_pending.get := false.B
+        /* 
+        Set the tag from the response only if one isn't already set.
+        The tag may have been set by a tag write forwarding.
+        */
         val tag = ldq_e.bits.phys_mte_tag.get
-        tag.valid := !respB.nack
-        tag.bits := respB.data
+        when (!tag.valid) {
+          tag.valid := !respB.nack
+          tag.bits := respB.data
+        }
 	      ldq_dump()
       }.elsewhen(respB.uop.uses_stq) {
         printf("[lsu] tcache response arrived STQ %d, addr=%x, nack=%d, tag=%x [tsc=%d]\n", respB.uop.stq_idx, stq(respB.uop.stq_idx).bits.addr.bits, respB.nack,respB.data, io.core.tsc_reg)
         val stq_e = stq(respB.uop.stq_idx)
         assert(stq_e.valid, "TCache response for invalid/freed entry")
-        assert(stq_e.bits.phys_mte_tag_executed.get, "TCache response for non-executed entry")
-        assert(!stq_e.bits.phys_mte_tag.get.valid, "TCache response attempting to overwrite valid tag")
+        stq_e.bits.commit_in_flight := false.B
 
         when (stq_e.bits.uop.is_mte_tag_write) {
           /* 
           If the write nack'd, we'll retry since the commit head won't change
           unless the store succeeded.
           */
-          printf("[lsu] tcache STQ %d tag write succedded [tsc=%d]\n", respB.uop.stq_idx, io.core.tsc_reg)
+          assert(IsOlder(respB.uop.stq_idx, stq_execute_head, stq_head), "Tag write response for rewound operation")
           assert(!stq_e.bits.succeeded, "Tag write already succeded?")
           stq_e.bits.succeeded := !respB.nack
           when (respB.nack) {
-            //XXX: This seems wrong as it replays unrelated stores (possibly
-            //leading to data loss in tight multi-core races?) but its how it
-            //works for stores.
-            //Allison TODO: Ask Jerry.
-            when (IsOlder(respB.uop.stq_idx, stq_execute_head, stq_head)) {
-              stq_execute_head := respB.uop.stq_idx
+            /*
+            When the TCache nacks a write, it gurentees that all younger writes
+            (including the incoming one right now) will be killed. This allows
+            us to safely rewind 
+            */
+            stq_execute_head_rewinds(0).valid := true.B
+            stq_execute_head_rewinds(0).bits := respB.uop.stq_idx
+
+            /* Kill all younger in-flight tag stores */
+            for (i <- 0 until numStqEntries) {
+              val stq_i_e = stq(i.U)
+              when (IsOlder(respB.uop.stq_idx, i.U, stq_head) && stq_i_e.bits.uop.is_mte_tag_write) {
+                stq_i_e.bits.commit_in_flight := false.B
+                when (stq_i_e.valid && stq_i_e.bits.commit_in_flight) {
+                  printf("[lsu] nack clearing tcache commit_in_flight STQ %d [tsc=%d]\n", i.U, io.core.tsc_reg)
+                }
+              }
             }
           }
         } .otherwise {
-          /* If we were nack'd, clear executed so we replay */
-          stq_e.bits.phys_mte_tag_executed.get := !respB.nack
+          assert(stq_e.bits.phys_mte_tag_pending.get, "TCache response for non-executed entry")
+
+          /* Clear the pending bit since the request has arrived */
+          stq_e.bits.phys_mte_tag_pending.get := false.B
+          /* 
+          Set the tag from the response only if one isn't already set.
+          The tag may have been set by a tag write forwarding.
+          */
           val tag = stq_e.bits.phys_mte_tag.get
-          tag.valid := !respB.nack
-          tag.bits := respB.data
+          when (!tag.valid) {
+            tag.valid := !respB.nack
+            tag.bits := respB.data
+          }
         }
 	      stq_dump()
       }.otherwise {
@@ -1196,7 +1257,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       s0_executing_loads(ldq_retry_idx) := dmem_req_fire(w)
       assert(!ldq_retry_e.bits.executed)
     } .elsewhen (will_fire_store_commit(w)) {
-      dmem_req(w).valid         := true.B
+      /* Don't refire if we have a valid in-flight/complete commit */
+      val already_launched = stq_commit_e.bits.commit_in_flight || stq_commit_e.bits.succeeded
+      dmem_req(w).valid         := !already_launched
       dmem_req(w).bits.addr     := stq_commit_e.bits.addr.bits
       dmem_req(w).bits.data     := (new freechips.rocketchip.rocket.StoreGen(
                                     stq_commit_e.bits.uop.mem_size, 0.U,
@@ -1204,11 +1267,13 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                     coreDataBytes)).data
       dmem_req(w).bits.uop      := stq_commit_e.bits.uop
 
-      stq_execute_head                     := Mux(dmem_req_fire(w),
-                                                WrapInc(stq_execute_head, numStqEntries),
-                                                stq_execute_head)
+      when ((dmem_req_fire(w) || already_launched)) {
+        stq_execute_head := WrapInc(stq_execute_head, numStqEntries)
+      }
 
-      stq(stq_execute_head).bits.succeeded := false.B
+      when (dmem_req_fire(w)) {
+        stq_commit_e.bits.commit_in_flight := true.B
+      }
     } .elsewhen (will_fire_load_wakeup(w)) {
       dmem_req(w).valid      := true.B
       dmem_req(w).bits.addr  := ldq_wakeup_e.bits.addr.bits
@@ -1349,6 +1414,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val fired_load_wakeup    = widthMap(w => RegNext(will_fire_load_wakeup  (w) && !IsKilledByBranch(io.core.brupdate, ldq_wakeup_e.bits.uop)))
   val fired_hella_incoming = RegNext(will_fire_hella_incoming)
   val fired_hella_wakeup   = RegNext(will_fire_hella_wakeup)
+  require(!useMTE || memWidth == 1, "MTE expecting memWidth=1")
+  val fired_stt_commit     = RegNext(will_fire_stt_commit(0) && tcache_did_fire)
 
   val mem_incoming_uop     = RegNext(widthMap(w => UpdateBrMask(io.core.brupdate, exe_req(w).bits.uop)))
   val mem_ldq_incoming_e   = RegNext(widthMap(w => UpdateBrMask(io.core.brupdate, ldq_incoming_e(w))))
@@ -1371,6 +1438,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val mem_tlb_miss             = RegNext(exe_tlb_miss)
   val mem_tlb_uncacheable      = RegNext(exe_tlb_uncacheable)
   val mem_paddr                = RegNext(widthMap(w => dmem_req(w).bits.addr))
+
+  val fired_tcache_address = useMTE.option(RegNext(io.tcache.get.req.bits.address))
+  val fired_tcache_data = useMTE.option(RegNext(io.tcache.get.req.bits.data))
 
   // Task 1: Clr ROB busy bit
   val clr_bsy_valid   = RegInit(widthMap(w => false.B))
@@ -1754,8 +1824,22 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         .otherwise
       {
         assert(io.dmem.nack(w).bits.uop.uses_stq)
+        printf("[lsu] dmem nack STQ %d [tsc=%d]\n", io.dmem.nack(w).bits.uop.stq_idx, io.core.tsc_reg)
+        stq(io.dmem.nack(w).bits.uop.stq_idx).bits.commit_in_flight := false.B
         when (IsOlder(io.dmem.nack(w).bits.uop.stq_idx, stq_execute_head, stq_head)) {
-          stq_execute_head := io.dmem.nack(w).bits.uop.stq_idx
+          stq_execute_head_rewinds(1).valid := true.B
+          stq_execute_head_rewinds(1).bits := io.dmem.nack(w).bits.uop.stq_idx
+          /* Kill all younger in-flight data stores */
+          for (i <- 0 until numStqEntries) {
+              val stq_i_e = stq(i.U)
+              when (IsOlder(io.dmem.nack(w).bits.uop.stq_idx, i.U, stq_head) && !stq_i_e.bits.uop.is_mte_tag_write) {
+                stq_i_e.bits.commit_in_flight := false.B
+                when (stq_i_e.valid && stq_i_e.bits.commit_in_flight) {
+                  printf("[lsu] nack clearing dmem commit_in_flight STQ %d [tsc=%d]\n", i.U, io.core.tsc_reg)
+                }
+              }
+            }
+
         }
       }
     }
@@ -1790,6 +1874,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         assert(!io.dmem.resp(w).bits.is_hella)
         assert(!stq(io.dmem.resp(w).bits.uop.stq_idx).bits.uop.is_mte_tag_write, "Tag write travelled down dmem path?")
         stq(io.dmem.resp(w).bits.uop.stq_idx).bits.succeeded := true.B
+        stq(io.dmem.resp(w).bits.uop.stq_idx).bits.commit_in_flight := false.B
         // ldq_dump()
         // stq_dump()
         printf("[lsu] dmem STQ %d addr=%x [tsc=%d]\n", io.dmem.resp(w).bits.uop.stq_idx, stq(io.dmem.resp(w).bits.uop.stq_idx).bits.addr.bits, io.core.tsc_reg)
@@ -1877,7 +1962,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         if (useMTE) {
           stq(i).bits.phys_mte_tag.get.valid := false.B
           stq(i).bits.phys_mte_tag.get.bits := 0xb.U
-          stq(i).bits.phys_mte_tag_executed.get := false.B
+          /* The TCache will kill any inflight requests so we can safely clear */
+          stq(i).bits.phys_mte_tag_pending.get := false.B
         }
         printf("[lsu] STQ %d, addr=%x killed by branch [tsc=%d]\n", i.U, stq(i).bits.addr.bits, io.core.tsc_reg)
         st_brkilled_mask(i)    := true.B
@@ -1901,7 +1987,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         if (useMTE) {
           ldq(i).bits.phys_mte_tag.get.valid := false.B
           ldq(i).bits.phys_mte_tag.get.bits := 0xb.U
-          ldq(i).bits.phys_mte_tag_executed.get := false.B
+          /* The TCache will kill any inflight requests so we can safely clear */
+          ldq(i).bits.phys_mte_tag_pending.get := false.B
         }
         printf("[lsu] LDQ %d, addr=%x killed by branch [tsc=%d]\n", i.U, ldq(i).bits.addr.bits, io.core.tsc_reg)
       }
@@ -1957,19 +2044,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         )
       }
     }
-    // when (io.core.commit.valids(w)) {
-    //   val general_commit_uopc = io.core.commit.uops(w)
-    //   dontTouch(general_commit_uopc)
-    //   printf("[LSU] general commit pc=%x, uopc=%d, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d, commit_load=%d, commit_store=%d\n", 
-    //   general_commit_uopc.debug_pc, general_commit_uopc.uopc, general_commit_uopc.uses_ldq, general_commit_uopc.ldq_idx,
-    //   general_commit_uopc.uses_stq, general_commit_uopc.stq_idx,
-    //   commit_load, commit_store)
-    // }
     
     temp_stq_commit_head = Mux(commit_store,
                                WrapInc(temp_stq_commit_head, numStqEntries),
                                temp_stq_commit_head)
-
   }
   stq_commit_head := temp_stq_commit_head
 
@@ -1982,7 +2060,15 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq_head_e.bits.phys_mte_tag.get.valid
     }
   }
-  when (ldq_head_e.valid && ldq_head_e.bits.committed && ldq_head_e_mte_phys_completed) {
+  val ldq_head_e_mte_phys_mte_tag_pending = ldq_head_e.bits.phys_mte_tag_pending.getOrElse(false.B)
+
+  when (ldq_head_e.valid && ldq_head_e.bits.committed && 
+        ldq_head_e_mte_phys_completed &&
+        /* 
+        The entry cannot be cleared (even if we forwarded a valid tag) when an
+        outstanding tag request exists in order to prevent a UaF
+        */
+        !ldq_head_e_mte_phys_mte_tag_pending) {
     assert ((ldq_head_e.bits.executed || ldq_head_e.bits.forward_std_val) && ldq_head_e.bits.succeeded,
       "[lsu] trying to clear an un-executed load entry.")
     
@@ -2005,7 +2091,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     if (useMTE) {
         ldq_head_e.bits.phys_mte_tag.get.valid := false.B
         ldq_head_e.bits.phys_mte_tag.get.bits := 0xa.U
-        ldq_head_e.bits.phys_mte_tag_executed.get := false.B
+        ldq_head_e.bits.phys_mte_tag_pending.get := false.B
     }
 
     ldq_head :=  WrapInc(ldq_head, numLdqEntries)
@@ -2020,6 +2106,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       stq_head_e.bits.phys_mte_tag.get.valid
     }
   }
+  val stq_head_e_mte_phys_mte_tag_pending = stq_head_e.bits.phys_mte_tag_pending.getOrElse(false.B)
+
   when (stq_head_e.valid && stq_head_e.bits.committed)
   {
     when (stq_head_e.bits.uop.is_fence && !io.dmem.ordered) {
@@ -2036,20 +2124,18 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       clear_store := stq_head_e.bits.succeeded
     } .otherwise {
       /* Other stq entry, i.e. a regular store */
-      clear_store := stq_head_e.bits.succeeded && stq_head_e_mte_phys_completed
+      clear_store := stq_head_e.bits.succeeded && 
+        stq_head_e_mte_phys_completed &&
+        /* 
+        The entry cannot be cleared (even if we forwarded a valid tag) when an
+        outstanding tag request exists in order to prevent a UaF
+        */
+        !stq_head_e_mte_phys_mte_tag_pending
     }
   }
 
   when (clear_store)
   {
-  if (useMTE) {
-      assert (
-        stq_head_e.bits.uop.is_fence || 
-        stq_head_e.bits.uop.is_mte_tag_write ||
-        stq_head_e.bits.phys_mte_tag_executed.get, 
-        "[lsu] trying to clear store before tags have arrived."
-      )
-    }
     val uop = stq_head_e.bits.uop
     printf("[lsu] STQ %x commit uopc=%x, mem_cmd=%x, addr=%x, addr_tag=%x, phys_tag=%x, stq_head=%x, stq_tail=%x [tsc=%d]\n", 
           stq_head, uop.uopc, uop.mem_cmd, stq_head_e.bits.addr.bits, stq_head_e.bits.addr_mte_tag.get, stq_head_e.bits.phys_mte_tag.get.bits,
@@ -2061,10 +2147,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     stq_head_e.bits.data.valid := false.B
     stq_head_e.bits.succeeded  := false.B
     stq_head_e.bits.committed  := false.B
+    stq_head_e.bits.commit_in_flight := false.B
     if (useMTE) {
         stq_head_e.bits.phys_mte_tag.get.valid := false.B
         stq_head_e.bits.phys_mte_tag.get.bits := 0xa.U
-        stq_head_e.bits.phys_mte_tag_executed.get := false.B
+        stq_head_e.bits.phys_mte_tag_pending.get := false.B
     }
 
     stq_head := WrapInc(stq_head, numStqEntries)
@@ -2073,6 +2160,77 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       stq_execute_head := WrapInc(stq_execute_head, numStqEntries)
     }
   }
+
+  /* 
+  Handle store queue execute rewinds 
+  We put this last so that it supercedes any similtaneous advances 
+  */
+  val stq_execute_head_rewind = stq_execute_head_rewinds.reduce({
+    (a, b) =>
+    Mux(!a.valid, b,
+    Mux(!b.valid, a,
+    Mux(IsOlder(a.bits, b.bits, stq_head), a,
+                                           b)))
+  })
+
+  when (stq_execute_head_rewind.valid) {
+    stq_execute_head := stq_execute_head_rewind.bits
+  }
+
+  /* 
+  Store-to-load fixup forwarding for tags
+  -------
+  The general idea here is that since the tag cache gurentees coherency (i.e. a
+  read reflects the most recent ack'd write) and because we fire writes into the
+  cache in-order, we can trivially implement memory ordering by simply smearing
+  writes forward to any younger tag loads which may have already executed.
+  While tag writes can nack (thereby allowing later reads to fetch the old
+  value), since we always retry tag commits until they work, we'll keep smearing
+  and rewriting until we succesfully get one into the cache pipeline that will
+  later be accepted.
+
+  We place this after the initial tag write to one up any tags that may be 
+  landing in the queues this cycle.
+  */
+  if (useMTE) {
+    val tag_granule_mask = ~((MTEConfig.taggingGranuleBytes - 1).U(coreMaxAddrBits.W))
+    val stt_masked_address = fired_tcache_address.get & tag_granule_mask
+    when (fired_stt_commit) {
+      for (i <- 0 until numLdqEntries) {
+        val ldq_e = ldq(i)
+        when (ldq_e.valid && 
+              /* 
+              A tag with a virtual address has not fired yet, and so even if it
+              aliases the tag we're forwarding, it will see the right tag
+              eventually
+              */
+              ldq_e.bits.addr.valid && !ldq_e.bits.addr_is_virtual &&
+                (ldq_e.bits.addr.bits & tag_granule_mask) === stt_masked_address &&
+              /* Is the tag write older than the load? */
+              IsOlder(stq_execute_head, ldq_e.bits.youngest_stq_idx, stq_head)) {
+          /* We're forwarding eligible! Overwrite the tag */
+          ldq_e.bits.phys_mte_tag.get.valid := true.B
+          ldq_e.bits.phys_mte_tag.get.bits := fired_tcache_data.get
+          printf("[lsu] forwarding tag write to LDQ %d [tsc=%d]\n", i.U, io.core.tsc_reg)
+        }
+      }
+
+      for (i <- 0 until numStqEntries) {
+        val stq_e = stq(i)
+        when (stq_e.valid && 
+              stq_e.bits.addr.valid && !stq_e.bits.addr_is_virtual &&
+                (stq_e.bits.addr.bits & tag_granule_mask) === stt_masked_address &&
+                !stq_e.bits.uop.is_fence && !stq_e.bits.uop.is_mte_tag_write
+                /* We don't need to check if its younger since we're the oldest by nature of being commit head */) {
+          /* We're forwarding eligible! Overwrite the tag */
+          stq_e.bits.phys_mte_tag.get.valid := true.B
+          stq_e.bits.phys_mte_tag.get.bits := fired_tcache_data.get
+          printf("[lsu] forwarding tag write to STQ %d [tsc=%d]\n", i.U, io.core.tsc_reg)
+        }
+      }
+    }
+  }
+
 
 
   // -----------------------
@@ -2191,10 +2349,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         stq(i).bits.data.valid := false.B
         stq(i).bits.succeeded  := false.B
         stq(i).bits.committed  := false.B
+        stq(i).bits.commit_in_flight  := false.B
         if (useMTE) {
           stq(i).bits.phys_mte_tag.get.valid := false.B
           stq(i).bits.phys_mte_tag.get.bits := 0xe.U
-          stq(i).bits.phys_mte_tag_executed.get := false.B
+          stq(i).bits.phys_mte_tag_pending.get := false.B
         }
         stq(i).bits.uop        := NullMicroOp
       }
@@ -2212,10 +2371,12 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
           stq(i).bits.data.valid := false.B
           stq(i).bits.succeeded  := false.B
           stq(i).bits.committed  := false.B
+          stq(i).bits.commit_in_flight  := false.B
           if (useMTE) {
             stq(i).bits.phys_mte_tag.get.valid := false.B
             stq(i).bits.phys_mte_tag.get.bits := 0xe.U
-            stq(i).bits.phys_mte_tag_executed.get := false.B
+            /* TCache will kill in-flight requests, okay to clear */
+            stq(i).bits.phys_mte_tag_pending.get := false.B
           }
           st_exc_killed_mask(i)  := true.B
         }
@@ -2234,7 +2395,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       if (useMTE) {
           ldq(i).bits.phys_mte_tag.get.valid := false.B
           ldq(i).bits.phys_mte_tag.get.bits := 0xe.U
-          ldq(i).bits.phys_mte_tag_executed.get := false.B
+          /* TCache will kill in-flight requests, okay to clear */
+          ldq(i).bits.phys_mte_tag_pending.get := false.B
       }
     }
   }
@@ -2246,6 +2408,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     Without this information, it cannot correctly kill in-flight tag operations.
     */
     io.tcache.get.st_exc_killed_mask := st_exc_killed_mask
+    io.tcache.get.stq_head_idx := stq_head
   }
 
   //-------------------------------------------------------------
