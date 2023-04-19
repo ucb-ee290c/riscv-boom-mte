@@ -744,7 +744,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     will_fire_store_commit  (w) := lsu_sched(can_fire_store_commit  (w) , false, true , false, false, false) //     , DC
     if (useMTE) {
     will_fire_stta_retry (w)    := lsu_sched(can_fire_stta_retry (w)    , true, false, false, false, false)  // TLB ,    ,      ,    ,  
-    will_fire_stt_commit (w)    := lsu_sched(can_fire_stt_commit (w)    , false, false, false, false, true)  //     ,    ,      ,    ,  TCACHE
+    will_fire_stt_commit (w)    := lsu_sched(can_fire_stt_commit (w)    , false, false, true, false, true)  //      ,    , LCAM ,    ,  TCACHE
     } else {
       will_fire_stta_retry (w)    := false.B
       will_fire_stt_commit (w)    := false.B
@@ -1441,6 +1441,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   val fired_tcache_address = useMTE.option(RegNext(io.tcache.get.req.bits.address))
   val fired_tcache_data = useMTE.option(RegNext(io.tcache.get.req.bits.data))
+  val fired_tcache_sidx = useMTE.option(RegNext(stq_execute_head))
+  val fired_tcache_previous_store_queue_head = useMTE.option(RegNext(stq_head))
 
   // Task 1: Clr ROB busy bit
   val clr_bsy_valid   = RegInit(widthMap(w => false.B))
@@ -1550,10 +1552,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // Load wakeups don't go through TLB, get it through memory
   // Load incoming and load retries go through both
 
-  val lcam_addr  = widthMap(w => Mux(fired_stad_incoming(w) || fired_sta_incoming(w) || fired_sta_retry(w),
-                                     RegNext(exe_tlb_paddr(w)),
-                                     Mux(fired_release(w), RegNext(io.dmem.release.bits.address),
-                                         mem_paddr(w))))
+  val lcam_addr  = widthMap(w => Mux(fired_stad_incoming(w) || fired_sta_incoming(w) || fired_sta_retry(w),RegNext(exe_tlb_paddr(w)),
+                                 Mux(fired_release(w), RegNext(io.dmem.release.bits.address),
+                                 Mux(fired_stt_commit, fired_tcache_address.getOrElse(0.U),
+                                    mem_paddr(w)))))
   val lcam_uop   = widthMap(w => Mux(do_st_search(w), mem_stq_e(w).bits.uop,
                                  Mux(do_ld_search(w), mem_ldq_e(w).bits.uop, NullMicroOp)))
 
@@ -1604,7 +1606,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     val l_is_forwarding   = l_forwarders.reduce(_||_)
     val l_forward_stq_idx = Mux(l_is_forwarding, Mux1H(l_forwarders, wb_forward_stq_idx), l_bits.forward_stq_idx)
 
-
+    val tag_granule_bits = log2Ceil(MTEConfig.taggingGranuleBytes)
+    val tag_addr_matches = widthMap(w => lcam_addr(w) >> tag_granule_bits === l_addr >> tag_granule_bits)
     val block_addr_matches = widthMap(w => lcam_addr(w) >> blockOffBits === l_addr >> blockOffBits)
     val dword_addr_matches = widthMap(w => block_addr_matches(w) && lcam_addr(w)(blockOffBits-1,3) === l_addr(blockOffBits-1,3))
     val mask_match   = widthMap(w => (l_mask & lcam_mask(w)) === l_mask)
@@ -1660,17 +1663,48 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
             can_forward(w)                     := false.B
           }
         }
+      } .elsewhen (fired_stt_commit &&
+                   l_valid &&
+                   l_bits.addr.valid &&
+                   !l_bits.addr_is_virtual &&
+                   tag_addr_matches(w) &&
+                   IsOlder(fired_tcache_sidx.getOrElse(0.U), l_bits.youngest_stq_idx, fired_tcache_previous_store_queue_head.getOrElse(0.U))) {
+  /* 
+  Store-to-load fixup forwarding for tags
+  -------
+  The general idea here is that since the tag cache gurentees coherency (i.e. a
+  read reflects the most recent ack'd write) and because we fire writes into the
+  cache in-order, we can trivially implement memory ordering by simply smearing
+  writes forward to any younger tag loads which may have already executed.
+  While tag writes can nack (thereby allowing later reads to fetch the old
+  value), since we always retry tag commits until they work, we'll keep smearing
+  and rewriting until we succesfully get one into the cache pipeline that will
+  later be accepted.
+
+  We place this after the initial tag write to one up any tags that may be 
+  landing in the queues this cycle.
+  */
+        if (useMTE) {
+          /* We're forwarding eligible! Overwrite the tag */
+          l_bits.phys_mte_tag.get.valid := true.B
+          l_bits.phys_mte_tag.get.bits := fired_tcache_data.get
+          printf("[lsu] LCAM forwarding tag write to LDQ %d [tsc=%d]\n", i.U, io.core.tsc_reg)
+        }
       }
     }
   }
 
   for (i <- 0 until numStqEntries) {
+    val s_bits = stq(i).bits
     val s_addr = stq(i).bits.addr.bits
     val s_uop  = stq(i).bits.uop
     val dword_addr_matches = widthMap(w =>
                              ( stq(i).bits.addr.valid      &&
                               !stq(i).bits.addr_is_virtual &&
                               (s_addr(corePAddrBits-1,3) === lcam_addr(w)(corePAddrBits-1,3))))
+    val tag_granule_bits = log2Ceil(MTEConfig.taggingGranuleBytes)
+    val tag_addr_matches = widthMap(w => lcam_addr(w) >> tag_granule_bits === s_addr >> tag_granule_bits)
+
     val write_mask = GenByteMask(s_addr, s_uop.mem_size)
     for (w <- 0 until memWidth) {
       when (do_ld_search(w) && stq(i).valid && lcam_st_dep_mask(w)(i)) {
@@ -1693,6 +1727,16 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
           io.dmem.s1_kill(w)                 := RegNext(dmem_req_fire(w))
           s1_set_execute(lcam_ldq_idx(w))    := false.B
         }
+      } .elsewhen (fired_stt_commit && stq(i).valid &&
+                     s_bits.addr.valid && !s_bits.addr_is_virtual &&
+                     tag_addr_matches(w) &&
+                     !s_uop.is_fence && !s_uop.is_mte_tag_write) {
+          if (useMTE) {
+            /* We're forwarding eligible! Overwrite the tag */
+            s_bits.phys_mte_tag.get.valid := true.B
+            s_bits.phys_mte_tag.get.bits := fired_tcache_data.get
+            printf("[lsu] LCAM forwarding tag write to STQ %d [tsc=%d]\n", i.U, io.core.tsc_reg)
+          }
       }
     }
   }
@@ -2176,62 +2220,6 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   when (stq_execute_head_rewind.valid) {
     stq_execute_head := stq_execute_head_rewind.bits
   }
-
-  /* 
-  Store-to-load fixup forwarding for tags
-  -------
-  The general idea here is that since the tag cache gurentees coherency (i.e. a
-  read reflects the most recent ack'd write) and because we fire writes into the
-  cache in-order, we can trivially implement memory ordering by simply smearing
-  writes forward to any younger tag loads which may have already executed.
-  While tag writes can nack (thereby allowing later reads to fetch the old
-  value), since we always retry tag commits until they work, we'll keep smearing
-  and rewriting until we succesfully get one into the cache pipeline that will
-  later be accepted.
-
-  We place this after the initial tag write to one up any tags that may be 
-  landing in the queues this cycle.
-  */
-  if (useMTE) {
-    val tag_granule_mask = ~((MTEConfig.taggingGranuleBytes - 1).U(coreMaxAddrBits.W))
-    val stt_masked_address = fired_tcache_address.get & tag_granule_mask
-    when (fired_stt_commit) {
-      for (i <- 0 until numLdqEntries) {
-        val ldq_e = ldq(i)
-        when (ldq_e.valid && 
-              /* 
-              A tag with a virtual address has not fired yet, and so even if it
-              aliases the tag we're forwarding, it will see the right tag
-              eventually
-              */
-              ldq_e.bits.addr.valid && !ldq_e.bits.addr_is_virtual &&
-                (ldq_e.bits.addr.bits & tag_granule_mask) === stt_masked_address &&
-              /* Is the tag write older than the load? */
-              IsOlder(stq_execute_head, ldq_e.bits.youngest_stq_idx, stq_head)) {
-          /* We're forwarding eligible! Overwrite the tag */
-          ldq_e.bits.phys_mte_tag.get.valid := true.B
-          ldq_e.bits.phys_mte_tag.get.bits := fired_tcache_data.get
-          printf("[lsu] forwarding tag write to LDQ %d [tsc=%d]\n", i.U, io.core.tsc_reg)
-        }
-      }
-
-      for (i <- 0 until numStqEntries) {
-        val stq_e = stq(i)
-        when (stq_e.valid && 
-              stq_e.bits.addr.valid && !stq_e.bits.addr_is_virtual &&
-                (stq_e.bits.addr.bits & tag_granule_mask) === stt_masked_address &&
-                !stq_e.bits.uop.is_fence && !stq_e.bits.uop.is_mte_tag_write
-                /* We don't need to check if its younger since we're the oldest by nature of being commit head */) {
-          /* We're forwarding eligible! Overwrite the tag */
-          stq_e.bits.phys_mte_tag.get.valid := true.B
-          stq_e.bits.phys_mte_tag.get.bits := fired_tcache_data.get
-          printf("[lsu] forwarding tag write to STQ %d [tsc=%d]\n", i.U, io.core.tsc_reg)
-        }
-      }
-    }
-  }
-
-
 
   // -----------------------
   // Hellacache interface
