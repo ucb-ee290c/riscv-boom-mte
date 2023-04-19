@@ -534,6 +534,7 @@ class BoomNonBlockingTCacheModule(
     */
     val s1_s2_op = Wire(new TCacheOperation()(p, tcacheParams))
     val s1_s2_op_valid = Wire(Bool())
+    val s1_s2_nack = Wire(Bool())
 
     /* We always need to access meta but don't always care to read data */
     s1_meta_read_value := metaArrays.read(
@@ -589,13 +590,33 @@ class BoomNonBlockingTCacheModule(
     currently in S2 because when we were in S0 it was writing meta in S1 (hazard)
     and now that we're in S1 it is writing the data we want to read in S2.
     */
-    val s1_hazard_blocked = s1_s2_op_valid && s1_s2_op.address.valid && 
-                            /* Hazards are caused by ops which write to the array */
-                            (s1_s2_op.requestType === TCacheRequestTypeEnum.WRITE ||
-                             TCacheRequestTypeEnum.is_replay(s1_s2_op.requestType)) &&
-                             /* We only have a hazard if they targeted the same record as us */
-                             s1_s2_op.address.bits.addressIndex === s1_op.address.bits.addressIndex
+    val s1_hazard_blocked = Wire(Bool())
 
+    /* We only have a hazard if they targeted the same record as us */
+    val s1_idx_matches_s2 = s1_s2_op.address.bits.addressIndex === s1_op.address.bits.addressIndex
+    when (!s1_s2_op_valid) {
+        /* Trivially hazard free -- nothing should be happening here */
+        s1_hazard_blocked := false.B
+    } .elsewhen (s1_s2_op.requestType === TCacheRequestTypeEnum.WRITE) {
+        /*
+        TODO: We might actually be able to get craftier and allow back to back
+        writes so long as we're sure metadata won't be corrupted.
+        */
+        /* The hazard only exists if the write actually happened */
+        s1_hazard_blocked := !s1_s2_nack && s1_idx_matches_s2
+    } .elsewhen (TCacheRequestTypeEnum.is_replay(s1_s2_op.requestType)) {
+        /* 
+        If the previous operation was a replay, our entire metadata is undefined
+        and so there's not much we can do.
+        */ 
+        s1_hazard_blocked := s1_idx_matches_s2
+    } .otherwise {
+        /* 
+        All other request types either don't flow down this pipeline or do not
+        write
+        */
+        s1_hazard_blocked := false.B
+    }
     val s1_nack = 
         (s1_needs_miss && !available_mshr.req_op.ready) || 
         s1_mshr_blocked ||
@@ -762,6 +783,7 @@ class BoomNonBlockingTCacheModule(
 
     s1_s2_op_valid := s2_op_valid
     s1_s2_op := s2_op
+    s1_s2_nack := s2_nack
 
     s2_data_read_value := dataArrays.read(
         s1_data_array_idx, 
