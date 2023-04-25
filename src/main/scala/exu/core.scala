@@ -278,12 +278,8 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
 
   if (useMTE) {
     val faCSR = custom_csrs.getWritableOpt(custom_csrs.smte_faCSR).get
-    faCSR.wport_wen := false.B
-    faCSR.wport_wdata := DontCare  
 
-    val fpcCSR = custom_csrs.getWritableOpt(custom_csrs.smte_fpcCSR).get
-    fpcCSR.wport_wen := false.B
-    fpcCSR.wport_wdata := DontCare  
+    val fstatusCSR = custom_csrs.getWritableOpt(custom_csrs.smte_fstatusCSR).get
 
     /* Pass the region configuration */
     
@@ -292,6 +288,56 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
     io.tcache.mtePermissiveTag := custom_csrs.mtePermissiveTag
     io.tcache.brupdate := brupdate
     io.tcache.exception := RegNext(rob.io.flush.valid) /* mirrors LSU */
+
+    io.lsu.mte_permissive_tag.get := custom_csrs.mtePermissiveTag
+
+    val fault_pkt = io.lsu.mte_fault_packet.get
+    val prv = csr.io.status.prv
+    val dprv = csr.io.status.dprv
+    val mte_enabled_prv = custom_csrs.mteEnabled(dprv)
+    val mteFStatusValid = custom_csrs.mteFStatusValid
+    dontTouch(prv)
+    dontTouch(dprv)
+    dontTouch(mteFStatusValid)
+    dontTouch(mte_enabled_prv)
+    when (mte_enabled_prv &&
+          fault_pkt.valid &&
+          /* latch only the first fault */
+          !custom_csrs.mteFStatusValid) {
+      printf("[core] mte fault addr=%x, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d, pc=%x [tsc=%d]\n", 
+        fault_pkt.bits.faulting_address,
+        fault_pkt.bits.uop.uses_ldq, fault_pkt.bits.uop.ldq_idx, fault_pkt.bits.uop.uses_stq, fault_pkt.bits.uop.stq_idx,
+        fault_pkt.bits.uop.debug_pc,
+        io.lsu.tsc_reg
+      )
+      /* New fault! Log it. */
+      fstatusCSR.wport_wen := true.B
+      val fstatus = Wire(UInt(xLen.W))
+      fstatus := Cat(
+        // /* valid */ 1.U(1.W),
+        // fault_pkt.bits.address_tag,
+        // fault_pkt.bits.physical_tag,
+        // prv,
+        // fault_pkt.bits.is_load,
+        // fault_pkt.bits.mem_size
+        fault_pkt.bits.mem_size,
+        fault_pkt.bits.is_load,
+        dprv,
+        fault_pkt.bits.physical_tag,
+        fault_pkt.bits.address_tag,
+        /* valid */ 1.U(1.W),
+      )
+      fstatusCSR.wport_wdata := fstatus
+      faCSR.wport_wen := true.B
+
+      faCSR.wport_wen := true.B
+      faCSR.wport_wdata := fault_pkt.bits.faulting_address  
+    } .otherwise {
+      fstatusCSR.wport_wen := false.B
+      fstatusCSR.wport_wdata := DontCare  
+      faCSR.wport_wen := false.B
+      faCSR.wport_wdata := DontCare  
+    }
   }
 
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))

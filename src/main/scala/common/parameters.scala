@@ -171,8 +171,8 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   def smte_faCSR : Option[CustomCSR] = 
     mteCSRGen(MTECSRs.smte_faID, xLenMask, 0, true)
   
-  def smte_fpcCSR : Option[CustomCSR] = 
-    mteCSRGen(MTECSRs.smte_fpcID, xLenMask, 1, true)
+  def smte_fstatusCSR : Option[CustomCSR] = 
+    mteCSRGen(MTECSRs.smte_fstatusID, xLenMask, 0, true)
 
   def smte_tagSeedCSR : Option[CustomCSR] = 
     mteCSRGen(MTECSRs.smte_tag_seedID, xLenMask, 0)
@@ -188,14 +188,20 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   }
 
   override def decls = super.decls ++ smte_configCSR ++ smte_faCSR ++ 
-    smte_fpcCSR ++ smte_tagSeedCSR ++ smte_tagbaseCSRs ++ smte_tagmaskCSRs
+    smte_fstatusCSR ++ smte_tagSeedCSR ++ smte_tagbaseCSRs ++ smte_tagmaskCSRs
 
   def disableOOO = getOrElse(chickenCSR, _.value(3), true.B)
 
   def mteEnabled = getOrElse(
     smte_configCSR, 
     _.value(MTECSRs.smte_config_enableShift + MTECSRs.smte_config_enableWidth - 1, MTECSRs.smte_config_enableShift), 
-    DontCare
+    0.U
+  )
+
+  def mteFStatusValid = getOrElse(
+    smte_fstatusCSR,
+    _.value(MTECSRs.smte_fstatus_validShift),
+    false.B
   )
 
   def mtePermissiveTag = getOrElse(

@@ -113,6 +113,15 @@ class LSUDMemIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
 
 }
 
+class MTEFaultPacket(implicit p: Parameters) extends BoomBundle()(p) 
+  with HasBoomUOP {
+  val faulting_address = UInt(coreMaxAddrBits.W)
+  val is_load = Bool()
+  val mem_size = UInt(2.W)
+  val physical_tag = UInt(MTEConfig.tagBits.W)
+  val address_tag = UInt(MTEConfig.tagBits.W)
+}
+
 class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
 {
   val exe = Vec(memWidth, new LSUExeIO)
@@ -161,13 +170,8 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
     val tlbMiss = Bool()
   })
 
-  // val mte_
-  // val mte_faCSR_wdata = useMTE.option(Output(UInt(xLen.W)))
-  // val mte_faCSR_wen   = useMTE.option(Output(Bool()))
-  // val mte_faCSR_wdata = useMTE.option(Output(UInt(xLen.W)))
-  // val mte_faCSR_wen   = useMTE.option(Output(Bool()))
-  // val mte_enabled = useMTE.option(Input(UInt(MTECSRs.smte_config_enableWidth.W)))
-  // val mte_permissive_tag = useMTE.option(Input(UInt(MTEConfig.tagBits.W)))
+  val mte_permissive_tag = useMTE.option(Input(UInt(MTEConfig.tagBits.W)))
+  val mte_fault_packet = useMTE.option(Output(Valid(new MTEFaultPacket)))
 }
 
 class LSUIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
@@ -260,6 +264,15 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val stq_tail         = Reg(UInt(stqAddrSz.W))
   val stq_commit_head  = Reg(UInt(stqAddrSz.W)) // point to next store to commit
   val stq_execute_head = Reg(UInt(stqAddrSz.W)) // point to next store to execute
+  val ldq_head_e = ldq(ldq_head)
+  val ldq_head_e_mte_phys_completed = {
+    if (!useMTE) {
+      true.B
+    } else {
+      ldq_head_e.bits.phys_mte_tag.get.valid
+    }
+  }
+val ldq_head_e_mte_phys_mte_tag_pending = ldq_head_e.bits.phys_mte_tag_pending.getOrElse(false.B)
   /*
   0 for tcache
   1 for dmem
@@ -610,6 +623,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                ( stq_retry_e.valid                            &&
                                  stq_retry_e.bits.addr.valid                  &&
                                  stq_retry_e.bits.addr_is_virtual             &&
+                                 /* tag retries handled by can_fire_stta_retry */
+                                 !stq_retry_e.bits.uop.is_mte_tag_write       &&
                                  (w == memWidth-1).B                          &&
                                  RegNext(dtlb.io.miss_rdy)                    &&
                                  !(widthMap(i => (i != w).B               &&
@@ -681,6 +696,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                               stq_commit_e.bits.addr.valid                  &&
                               !stq_commit_e.bits.addr_is_virtual            &&
                               stq_commit_e.bits.data.valid))
+// val can_fire_load_clear_tag_lcam = widthMap(w =>
+//   ldq_head_e.valid
+  
+// )
 
   //---------------------------------------------------------
   // Controller logic. Arbitrate which request actually fires
@@ -723,7 +742,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     if (useMTE) {
     //Even though STTA isn't really that high priority, we need to handling all incoming requests over retries
     //to avoid dropping it on the floor
-    will_fire_stta_incoming (w) := lsu_sched(can_fire_stta_incoming (w) , true, false, false, false, false)  // TLB ,    ,      ,    ,  
+    will_fire_stta_incoming (w) := lsu_sched(can_fire_stta_incoming (w) , true, false, false, true, false)  // TLB ,    ,      ,  ROB ,  
     } else {
       will_fire_stta_incoming (w) := false.B
     }
@@ -743,7 +762,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     will_fire_load_wakeup   (w) := lsu_sched(can_fire_load_wakeup   (w) , false, true , true , false, false) //     , DC , LCAM1
     will_fire_store_commit  (w) := lsu_sched(can_fire_store_commit  (w) , false, true , false, false, false) //     , DC
     if (useMTE) {
-    will_fire_stta_retry (w)    := lsu_sched(can_fire_stta_retry (w)    , true, false, false, false, false)  // TLB ,    ,      ,    ,  
+    will_fire_stta_retry (w)    := lsu_sched(can_fire_stta_retry (w)    , true, false, false, true, false)  //  TLB ,    ,      , ROB ,  
     will_fire_stt_commit (w)    := lsu_sched(can_fire_stt_commit (w)    , false, false, true, false, true)  //      ,    , LCAM ,    ,  TCACHE
     } else {
       will_fire_stta_retry (w)    := false.B
@@ -785,32 +804,37 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                         will_fire_stad_incoming (w) ||
                         will_fire_sta_incoming  (w) ||
                         will_fire_sfence        (w) ||
-                        will_fire_stta_incoming (w) || 
-                        will_fire_stta_retry    (w)  , exe_req(w).bits.uop,
+                        will_fire_stta_incoming (w)  , exe_req(w).bits.uop,
                     Mux(will_fire_load_retry    (w)  , ldq_retry_e.bits.uop,
+                    Mux(will_fire_stta_retry    (w)  , stta_retry_e.bits.uop,
                     Mux(will_fire_sta_retry     (w)  , stq_retry_e.bits.uop,
                     Mux(will_fire_hella_incoming(w)  , NullMicroOp,
-                                                       NullMicroOp)))))
+                                                       NullMicroOp))))))
 
+  when (exe_tlb_uop(0).uses_stq && exe_tlb_uop(0).is_mte_tag_write) {
+    assert(!exe_tlb_uop(0).ctrl.is_sta, "Cracked tag write?")
+  }
   val exe_tlb_vaddr = widthMap(w =>
                     Mux(will_fire_load_incoming (w) ||
                         will_fire_stad_incoming (w) ||
                         will_fire_sta_incoming  (w) ||
-                        will_fire_stta_incoming (w) || 
-                        will_fire_stta_retry    (w)  , exe_req(w).bits.addr,
+                        will_fire_stta_incoming (w)  , exe_req(w).bits.addr,
                     Mux(will_fire_sfence        (w)  , exe_req(w).bits.sfence.bits.addr,
                     Mux(will_fire_load_retry    (w)  , ldq_retry_e.bits.addr.bits,
+                    Mux(will_fire_stta_retry    (w)  , stta_retry_e.bits.addr.bits,
                     Mux(will_fire_sta_retry     (w)  , stq_retry_e.bits.addr.bits,
                     Mux(will_fire_hella_incoming(w)  , hella_req.addr,
-                                                       0.U))))))
+                                                       0.U)))))))
+
   val ldst_vaddr_mte_tag = widthMap(w => {
     if (useMTE) {
       Mux(will_fire_load_incoming (w) ||
           will_fire_stad_incoming (w) ||
           will_fire_sta_incoming  (w)  , exe_req(w).bits.mte_tag.get,
       Mux(will_fire_load_retry    (w)  , ldq_retry_e.bits.addr_mte_tag.get,
+      Mux(will_fire_stta_retry    (w)  , stta_retry_e.bits.addr_mte_tag.get,
       Mux(will_fire_sta_retry     (w)  , stq_retry_e.bits.addr_mte_tag.get,
-                                         0.U)))
+                                         0.U))))
     } else {
       DontCare
     }
@@ -973,17 +997,6 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                       v
                     }))))
 
-  val tcache_will_fire = widthMap(w =>
-    will_fire_load_incoming (w) ||
-    will_fire_stad_incoming (w) ||
-    will_fire_sta_incoming  (w) ||
-    will_fire_load_retry    (w) ||
-    will_fire_sta_retry     (w) ||
-    will_fire_ldq_tag_retry (w) ||
-    will_fire_stq_tag_retry (w) ||
-    will_fire_stt_commit    (w)
-  )
-
   val tcache_ldq_e = widthMap(w =>
                     Mux(will_fire_load_incoming (w)  , ldq_incoming_e(w),
                     Mux(will_fire_load_retry    (w)  , ldq_retry_e,
@@ -1014,10 +1027,22 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     Mux(tcache_ldq_e(w).valid, tcache_ldq_e(w).bits.uop, tcache_stq_e(w).bits.uop)
   })
 
+  val tcache_will_fire = widthMap(w =>
+    will_fire_load_incoming (w) ||
+    will_fire_stad_incoming (w) ||
+    will_fire_sta_incoming  (w) ||
+    will_fire_load_retry    (w) ||
+    will_fire_sta_retry     (w) ||
+    will_fire_ldq_tag_retry (w) ||
+    will_fire_stq_tag_retry (w) ||
+    will_fire_stt_commit    (w)
+  )
+
   val tcache_is_incoming = widthMap(w =>
-		       will_fire_load_incoming (w) ||
-                       will_fire_stad_incoming (w) ||
-                       will_fire_sta_incoming  (w))
+    will_fire_load_incoming (w) ||
+    will_fire_stad_incoming (w) ||
+    will_fire_sta_incoming  (w)
+  )
 
   val tcache_did_fire = Wire(Bool())
   tcache_did_fire := false.B
@@ -1106,7 +1131,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
           when (tcache_uop(w).is_mte_tag_write) {
             val already_launched = e.bits.commit_in_flight || e.bits.succeeded
             /* Mark the commit in flight */
-            assert(can_fire ^ already_launched, "Attempting to re-execute an executed tag write")
+            assert(!can_fire || (can_fire && !already_launched), "Attempting to re-execute an executed tag write")
             when (can_fire) {
               e.bits.commit_in_flight := true.B
             }
@@ -1166,7 +1191,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
           If the write nack'd, we'll retry since the commit head won't change
           unless the store succeeded.
           */
-          assert(IsOlder(respB.uop.stq_idx, stq_execute_head, stq_head), "Tag write response for rewound operation")
+	        assert(stq_e.bits.commit_in_flight, "Response for rewound/unlaunched tag write operation?")
           assert(!stq_e.bits.succeeded, "Tag write already succeded?")
           stq_e.bits.succeeded := !respB.nack
           when (respB.nack) {
@@ -1175,7 +1200,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
             (including the incoming one right now) will be killed. This allows
             us to safely rewind 
             */
-            stq_execute_head_rewinds(0).valid := true.B
+            stq_execute_head_rewinds(0).valid := IsOlder(respB.uop.stq_idx, stq_execute_head, stq_head)
             stq_execute_head_rewinds(0).bits := respB.uop.stq_idx
 
             /* Kill all younger in-flight tag stores */
@@ -1327,6 +1352,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         phys_mte_tag.valid := false.B
         phys_mte_tag.bits := DontCare
       }
+      when (!exe_tlb_miss(w)) {
+        printf("[lsu] tlb translates V%x->P%x (ldq=%d) [tsc=%d]\n", exe_tlb_vaddr(w), exe_tlb_paddr(w), ldq_idx, io.core.tsc_reg)
+      }
       ldq(ldq_idx).bits.uop.pdst            := exe_tlb_uop(w).pdst
       ldq(ldq_idx).bits.addr_is_virtual     := exe_tlb_miss(w)
       ldq(ldq_idx).bits.addr_is_uncacheable := exe_tlb_uncacheable(w) && !exe_tlb_miss(w)
@@ -1350,6 +1378,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         val phys_mte_tag = stq(stq_idx).bits.phys_mte_tag.get
         phys_mte_tag.valid := false.B
         phys_mte_tag.bits := DontCare
+      }
+      when (!exe_tlb_miss(w)) {
+        printf("[lsu] tlb translates V%x->P%x (stq=%d) [tsc=%d]\n", exe_tlb_vaddr(w), exe_tlb_paddr(w), stq_idx, io.core.tsc_reg)
       }
       stq(stq_idx).bits.uop.pdst   := exe_tlb_uop(w).pdst // Needed for AMOs
       stq(stq_idx).bits.addr_is_virtual := exe_tlb_miss(w)
@@ -1454,7 +1485,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     clr_bsy_rob_idx (w) := 0.U
     clr_bsy_brmask  (w) := 0.U
 
-
+    val uop = RegInit(NullMicroOp)
     when (fired_stad_incoming(w)) {
       clr_bsy_valid   (w) := mem_stq_incoming_e(w).valid           &&
                             !mem_tlb_miss(w)                       &&
@@ -1462,6 +1493,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                             !IsKilledByBranch(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
       clr_bsy_rob_idx (w) := mem_stq_incoming_e(w).bits.uop.rob_idx
       clr_bsy_brmask  (w) := GetNewBrMask(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
+      uop := mem_stq_incoming_e(w).bits.uop
     } .elsewhen (fired_sta_incoming(w)) {
       clr_bsy_valid   (w) := mem_stq_incoming_e(w).valid            &&
                              mem_stq_incoming_e(w).bits.data.valid  &&
@@ -1470,6 +1502,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                             !IsKilledByBranch(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
       clr_bsy_rob_idx (w) := mem_stq_incoming_e(w).bits.uop.rob_idx
       clr_bsy_brmask  (w) := GetNewBrMask(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
+      uop := mem_stq_incoming_e(w).bits.uop
     } .elsewhen (fired_std_incoming(w)) {
       clr_bsy_valid   (w) := mem_stq_incoming_e(w).valid                 &&
                              mem_stq_incoming_e(w).bits.addr.valid       &&
@@ -1478,9 +1511,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                             !IsKilledByBranch(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
       clr_bsy_rob_idx (w) := mem_stq_incoming_e(w).bits.uop.rob_idx
       clr_bsy_brmask  (w) := GetNewBrMask(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
+      uop := mem_stq_incoming_e(w).bits.uop
     } .elsewhen (fired_sfence(w)) {
       clr_bsy_valid   (w) := (w == 0).B // SFence proceeds down all paths, only allow one to clr the rob
       clr_bsy_rob_idx (w) := mem_incoming_uop(w).rob_idx
+      uop := mem_incoming_uop(w)
       clr_bsy_brmask  (w) := GetNewBrMask(io.core.brupdate, mem_incoming_uop(w))
     } .elsewhen (fired_sta_retry(w)) {
       clr_bsy_valid   (w) := mem_stq_retry_e.valid            &&
@@ -1490,24 +1525,36 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                             !IsKilledByBranch(io.core.brupdate, mem_stq_retry_e.bits.uop)
       clr_bsy_rob_idx (w) := mem_stq_retry_e.bits.uop.rob_idx
       clr_bsy_brmask  (w) := GetNewBrMask(io.core.brupdate, mem_stq_retry_e.bits.uop)
+      uop := mem_stq_retry_e.bits.uop
     } .elsewhen (fired_stta_incoming(w)) {
       clr_bsy_valid   (w) := mem_stq_incoming_e(w).valid         &&
                              !mem_tlb_miss(w)                    &&
                              !IsKilledByBranch(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
       clr_bsy_rob_idx (w) := mem_stq_incoming_e(w).bits.uop.rob_idx
       clr_bsy_brmask  (w) := GetNewBrMask(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
+      uop := mem_stq_incoming_e(w).bits.uop
     } .elsewhen(fired_stta_retry(w)) {
       clr_bsy_valid   (w) := mem_stta_retry_e.valid            &&
                             !mem_tlb_miss(w)                   &&
                             !IsKilledByBranch(io.core.brupdate, mem_stta_retry_e.bits.uop)
       clr_bsy_rob_idx (w) := mem_stta_retry_e.bits.uop.rob_idx
       clr_bsy_brmask  (w) := GetNewBrMask(io.core.brupdate, mem_stta_retry_e.bits.uop)
+      uop := mem_stta_retry_e.bits.uop
     }
 
     io.core.clr_bsy(w).valid := clr_bsy_valid(w) &&
                                !IsKilledByBranch(io.core.brupdate, clr_bsy_brmask(w)) &&
                                !io.core.exception && !RegNext(io.core.exception) && !RegNext(RegNext(io.core.exception))
     io.core.clr_bsy(w).bits  := clr_bsy_rob_idx(w)
+
+    when (clr_bsy_valid(w) &&
+            !IsKilledByBranch(io.core.brupdate, clr_bsy_brmask(w)) &&
+            !io.core.exception && !RegNext(io.core.exception) && !RegNext(RegNext(io.core.exception))) {
+      printf("[lsu] clr_bsy uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d, pc=%x [tsc=%d]\n",
+        uop.uses_ldq, uop.ldq_idx, uop.uses_stq, uop.stq_idx,
+        uop.debug_pc, io.core.tsc_reg
+      )
+    }
   }
 
   val stdf_clr_bsy_valid   = RegInit(false.B)
@@ -1870,21 +1917,19 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         assert(io.dmem.nack(w).bits.uop.uses_stq)
         printf("[lsu] dmem nack STQ %d [tsc=%d]\n", io.dmem.nack(w).bits.uop.stq_idx, io.core.tsc_reg)
         stq(io.dmem.nack(w).bits.uop.stq_idx).bits.commit_in_flight := false.B
-        when (IsOlder(io.dmem.nack(w).bits.uop.stq_idx, stq_execute_head, stq_head)) {
-          stq_execute_head_rewinds(1).valid := true.B
-          stq_execute_head_rewinds(1).bits := io.dmem.nack(w).bits.uop.stq_idx
-          /* Kill all younger in-flight data stores */
-          for (i <- 0 until numStqEntries) {
-              val stq_i_e = stq(i.U)
-              when (IsOlder(io.dmem.nack(w).bits.uop.stq_idx, i.U, stq_head) && !stq_i_e.bits.uop.is_mte_tag_write) {
-                stq_i_e.bits.commit_in_flight := false.B
-                when (stq_i_e.valid && stq_i_e.bits.commit_in_flight) {
-                  printf("[lsu] nack clearing dmem commit_in_flight STQ %d [tsc=%d]\n", i.U, io.core.tsc_reg)
-                }
+        stq_execute_head_rewinds(1).valid := IsOlder(io.dmem.nack(w).bits.uop.stq_idx, stq_execute_head, stq_head)
+        stq_execute_head_rewinds(1).bits := io.dmem.nack(w).bits.uop.stq_idx
+        
+        /* Kill all younger in-flight data stores */
+        for (i <- 0 until numStqEntries) {
+            val stq_i_e = stq(i.U)
+            when (IsOlder(io.dmem.nack(w).bits.uop.stq_idx, i.U, stq_head) && !stq_i_e.bits.uop.is_mte_tag_write) {
+              stq_i_e.bits.commit_in_flight := false.B
+              when (stq_i_e.valid && stq_i_e.bits.commit_in_flight) {
+                printf("[lsu] nack clearing dmem commit_in_flight STQ %d [tsc=%d]\n", i.U, io.core.tsc_reg)
               }
             }
-
-        }
+          }
       }
     }
     // Handle the response
@@ -2096,23 +2141,27 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   stq_commit_head := temp_stq_commit_head
 
   // loads which have commited (and thus executed) as well as retrived tags can be cleared
-  val ldq_head_e = ldq(ldq_head)
-  val ldq_head_e_mte_phys_completed = {
-    if (!useMTE) {
-      true.B
-    } else {
-      ldq_head_e.bits.phys_mte_tag.get.valid
-    }
+  val ldq_head_dependent_tag_write_candidates_1h = (0 until numStqEntries).map{i =>
+    Mux(ldq_head_e.bits.st_dep_mask(i),
+        stq(i).bits.uop.is_mte_tag_write &&
+          /* Block only on unforwarded tag writes */
+          !(stq(i).bits.commit_in_flight || stq(i).bits.succeeded),
+        false.B
+    )
   }
-  val ldq_head_e_mte_phys_mte_tag_pending = ldq_head_e.bits.phys_mte_tag_pending.getOrElse(false.B)
-
-  when (ldq_head_e.valid && ldq_head_e.bits.committed && 
-        ldq_head_e_mte_phys_completed &&
-        /* 
-        The entry cannot be cleared (even if we forwarded a valid tag) when an
-        outstanding tag request exists in order to prevent a UaF
-        */
-        !ldq_head_e_mte_phys_mte_tag_pending) {
+  val ldq_head_has_dependent_tag_write_candidates = 
+    ldq_head_dependent_tag_write_candidates_1h.reduce( _ || _)
+  
+  val clear_load = 
+    ldq_head_e.valid && ldq_head_e.bits.committed && 
+    ldq_head_e_mte_phys_completed &&
+    /* 
+    The entry cannot be cleared (even if we forwarded a valid tag) when an
+    outstanding tag request exists in order to prevent a UaF
+    */
+    !ldq_head_e_mte_phys_mte_tag_pending &&
+    !ldq_head_has_dependent_tag_write_candidates
+  when (clear_load) {
     assert ((ldq_head_e.bits.executed || ldq_head_e.bits.forward_std_val) && ldq_head_e.bits.succeeded,
       "[lsu] trying to clear an un-executed load entry.")
     
@@ -2199,7 +2248,20 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     }
 
     stq_head := WrapInc(stq_head, numStqEntries)
-    when (stq_head_e.bits.uop.is_fence)
+    when (stq_head_e.bits.uop.is_fence ||
+      /*
+      This is a weird quirk of the way we handle dmem and tcache nacks.
+      If an older dmem store nacks after a younger tcache stt completes, we
+      don't kill the stt and instead leave it in the stq as completed and just
+      don't relaunch it (or vice versa).
+      
+      When such an entry is seen by the firing logic, it simply advances the 
+      execute head. Notably, however, is that if the entry is the stq head and 
+      it completed previously, it is store eligible. This is a problem if the 
+      desired cache is not ready and cannot advance the pointer as it means 
+      execute head begins to trail. Fix this up.
+      */
+          stq_head === stq_execute_head)
     {
       stq_execute_head := WrapInc(stq_execute_head, numStqEntries)
     }
@@ -2409,6 +2471,82 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                     ~(st_brkilled_mask.asUInt) &
                     ~(st_exc_killed_mask.asUInt)
 
+
+  /*
+  Generate MTE Faults
+  -------------------
+  Since we presently only support async mode and leave tag check to the absolute
+  last possible moment (when entries are being cleared).
+  At this point, we know that the tag at stq_head is at its final value as it is
+  the oldest entry in the store queue (and thus there are no remaining tag writes
+  which could overwrite it). The same is not true for the head of the load queue
+  however because there may be 
+
+  Unless we use LCAM to do store to load forwarding on each load (rather than the
+  store forwarding on commit), we have to clear in order
+
+
+  We can do something kinda evil--we can stall load clears until st_dep_mask is
+  free of any tag writes
+    * This is safe because the queues are ordered and so the store queue is
+      guraneteed to make progress even with a full and blocked load queue.
+    * This is likely to give very bad performance for compiler instrumented
+      tagging as there will be many possible dependent tag stores
+  
+  Could add a new task for loads which is just a tag load searcher.
+    * Once a load is committed, it can search for older tag writes using 
+      LCAM. Once this process is complete, it can safely clear.
+    * Once a store 
+  */
+
+  if (useMTE) {
+    val pkt = io.core.mte_fault_packet.get
+    val permissive_tag = io.core.mte_permissive_tag.get
+    val cleared_store_older = IsOlder(stq_head, ldq_head_e.bits.youngest_stq_idx, stq_head)
+    dontTouch(pkt)
+    dontTouch(cleared_store_older)
+    dontTouch(clear_load)
+    dontTouch(clear_store)
+    val clear_load_valid = clear_load && ldq_head_e.valid && 
+      !io.core.exception && 
+      !(ldq_head_e.bits.uop.is_mte_tag_write || ldq_head_e.bits.uop.is_fence || ldq_head_e.bits.uop.is_fencei)
+    val clear_store_valid = clear_store && stq_head_e.valid && 
+      !io.core.exception &&
+      !(stq_head_e.bits.uop.is_mte_tag_write || stq_head_e.bits.uop.is_fence || stq_head_e.bits.uop.is_fencei)
+    dontTouch(clear_load_valid)
+    dontTouch(clear_store_valid)
+
+    pkt.valid := false.B
+    pkt.bits := DontCare
+    when (clear_load_valid) {
+      val addr_tag = ldq_head_e.bits.addr_mte_tag.get
+      val phys_tag = ldq_head_e.bits.phys_mte_tag.get.bits
+      when (addr_tag =/= phys_tag && phys_tag =/= permissive_tag) {
+        pkt.valid := true.B
+        pkt.bits.address_tag := addr_tag
+        pkt.bits.physical_tag := phys_tag
+        pkt.bits.is_load := true.B
+        pkt.bits.faulting_address := ldq_head_e.bits.addr.bits
+        pkt.bits.mem_size := ldq_head_e.bits.uop.mem_size
+        pkt.bits.uop := ldq_head_e.bits.uop
+      }
+    }
+
+    when (clear_store_valid) {
+      val addr_tag = stq_head_e.bits.addr_mte_tag.get
+      val phys_tag = stq_head_e.bits.phys_mte_tag.get.bits
+      when (addr_tag =/= phys_tag && phys_tag =/= permissive_tag &&
+            (!clear_load_valid || cleared_store_older)) {
+        pkt.valid := true.B
+        pkt.bits.address_tag := addr_tag
+        pkt.bits.physical_tag := phys_tag
+        pkt.bits.is_load := false.B
+        pkt.bits.faulting_address := stq_head_e.bits.addr.bits
+        pkt.bits.mem_size := stq_head_e.bits.uop.mem_size
+        pkt.bits.uop := stq_head_e.bits.uop
+      }
+    }
+  }
 
 }
 

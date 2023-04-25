@@ -360,7 +360,6 @@ class Rob(
     for (clr_rob_idx <- io.lsu_clr_bsy) {
       when (clr_rob_idx.valid && MatchBank(GetBankIdx(clr_rob_idx.bits))) {
         val cidx = GetRowIdx(clr_rob_idx.bits)
-        printf("[rob] clearing unsafe/bsy (1)\n")
         rob_bsy(cidx)    := false.B
         rob_unsafe(cidx) := false.B
         assert (rob_val(cidx) === true.B, "[rob] store writing back to invalid entry.")
@@ -369,7 +368,6 @@ class Rob(
     }
     for (clr <- io.lsu_clr_unsafe) {
       when (clr.valid && MatchBank(GetBankIdx(clr.bits))) {
-        printf("[rob] clearing unsafe (2)\n")
         val cidx = GetRowIdx(clr.bits)
         rob_unsafe(cidx) := false.B
       }
