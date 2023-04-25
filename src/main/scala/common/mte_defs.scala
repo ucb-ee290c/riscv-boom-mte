@@ -48,8 +48,8 @@ object MTECSRs {
     (Table 2.1: Allocation of RISC-V CSR address ranges.)
     */
     val smte_configID   = 0x5c0
-    val smte_faID       = 0x5c1
-    val smte_fpcID      = 0x5c2
+    val smte_fstatusID  = 0x5c1
+    val smte_faID       = 0x5c2
     val smte_tag_seedID = 0x5c3
 
     private val smte_tag_base_min_id = 0x5c4
@@ -78,9 +78,22 @@ object MTECSRs {
         (BigInt(1) << width) - 1
     }
     def smte_config_enableShift         =   0
-    def smte_config_enableWidth         =   3
-    def smte_config_enforceSyncShift    =   3
-    def smte_config_enforceSyncWidth    =   3
-    def smte_config_permissiveTagShift  =   6
+    def smte_config_enableWidth         =   4
+    def smte_config_enforceSyncShift    =   smte_config_enableShift + smte_config_enableWidth
+    def smte_config_enforceSyncWidth    =   4
+    def smte_config_permissiveTagShift  =   smte_config_enforceSyncShift + smte_config_enforceSyncWidth
     def smte_config_permissiveTagWidth  =   4
+
+    def smte_fstatus_validShift         =  0
+    def smte_fstatus_validWidth         =  1
+    def smte_fstatus_addressTagShift = smte_fstatus_validShift + smte_fstatus_validWidth
+    def smte_fstatus_addressTagWidth = MTEConfig.tagBits
+    def smte_fstatus_physicalTagShift =  smte_fstatus_addressTagShift + smte_fstatus_addressTagWidth
+    def smte_fstatus_physicalTagWidth =  MTEConfig.tagBits
+    def smte_fstatus_privShift = smte_fstatus_physicalTagShift + smte_fstatus_physicalTagWidth
+    def smte_fstatus_privWidth = 2
+    def smte_fstatus_isLoadShift = smte_fstatus_privShift + smte_fstatus_privWidth
+    def smte_fstatus_isLoadWidth = 1
+    def smte_fstatus_opSizeShift = smte_fstatus_isLoadShift + smte_fstatus_isLoadWidth
+    def smte_fstatus_opSizeWidth = 2
 }
