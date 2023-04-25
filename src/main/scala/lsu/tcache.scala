@@ -8,7 +8,7 @@ import freechips.rocketchip.rocket.{HellaCacheIO, SimpleHellaCacheIF}
 import boom.common._
 import boom.lsu._
 import boom.exu.{BrUpdateInfo}
-import boom.util.{IsKilledByBranch, GetNewBrMask}
+import boom.util.{IsKilledByBranch, GetNewBrMask, UpdateBrMask}
 import freechips.rocketchip.util.DescribedSRAM
 import chisel3.experimental.ChiselEnum
 import freechips.rocketchip.tile.HasCoreParameters
@@ -517,7 +517,7 @@ class BoomNonBlockingTCacheModule(
 
     when (s0_op_valid) {
         assert(s0_is_executing_replay ^ io.lsu.req.fire, "Arbiter drew from two sources?")
-        printf("[tcache] decoded tag storage address -> %x (sel=%x) uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d. type=%d, data=%x [tsc=%d]\n", s0_op.address.bits.address, s0_op.address.bits.subByteTagSelect, s0_op.uop.uses_ldq, s0_op.uop.ldq_idx, s0_op.uop.uses_stq, s0_op.uop.stq_idx, s0_op.requestType.asUInt, s0_op.data, io.core.tsc_reg)
+        printf("[tcache] decoded tag storage address -> %x (tag=%x, idx=%x, offset=%x, sel=%x) uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d. type=%d, data=%x [tsc=%d]\n", s0_op.address.bits.address, s0_op.address.bits.addressTag, s0_op.address.bits.addressIndex, s0_op.address.bits.addressOffset,  s0_op.address.bits.subByteTagSelect, s0_op.uop.uses_ldq, s0_op.uop.ldq_idx, s0_op.uop.uses_stq, s0_op.uop.stq_idx, s0_op.requestType.asUInt, s0_op.data, io.core.tsc_reg)
     }
 
     /* ~* Stage 1 *~ */
@@ -635,9 +635,9 @@ class BoomNonBlockingTCacheModule(
     s1_victim_way_idx.valid := false.B
     s1_victim_way_idx.bits := DontCare
 
+    val s1_is_writing_metadata = Wire(Bool())
     when (s1_op_valid && !s1_nack &&
           s1_op.requestType === TCacheRequestTypeEnum.WRITE && s1_hit) {
-        // assert(!s1_nack, "A nack'd operation is attempting to write metadata")
         /* Write hit. We simply need to mark the line as dirty */
         // Write to the way we hit
         s1_meta_wmask := s1_way_hit_map
@@ -647,9 +647,10 @@ class BoomNonBlockingTCacheModule(
         new_meta := s1_meta_read_value(s1_way_hit_idx)
         new_meta.dirty := true.B
         s1_meta_wdata := VecInit(Seq.fill(tcacheParams.nWays)(new_meta.asUInt))
+
+        s1_is_writing_metadata := true.B
     }.elsewhen (s1_op_valid && !s1_nack &&
                 TCacheRequestTypeEnum.is_replay(s1_op.requestType)) {
-        // assert(!s1_nack, "A nack'd operation is attempting to write metadata")
         /*
         Replays are generated for misses and so we need to pick a victim and
         evict them in order to generate our write.
@@ -673,10 +674,14 @@ class BoomNonBlockingTCacheModule(
         */
         new_meta.dirty := s1_op.requestType === TCacheRequestTypeEnum.REPLAY_WRITE
         s1_meta_wdata := VecInit(Seq.fill(tcacheParams.nWays)(new_meta.asUInt))
+
+        s1_is_writing_metadata := true.B
     }.otherwise {
         /* We're not writing to meta, mask off the write */
         s1_meta_wmask := VecInit(Seq.fill(tcacheParams.nWays)(false.B))
         s1_meta_wdata := DontCare
+
+        s1_is_writing_metadata := false.B
     }
 
     metaArrays.write(
@@ -687,6 +692,7 @@ class BoomNonBlockingTCacheModule(
     dontTouch(s1_op.address.bits.addressIndex)
     dontTouch(s1_meta_wdata)
     dontTouch(s1_meta_wmask)
+    dontTouch(s1_is_writing_metadata)
 
     /* Handle writebacks */
     val s1_replay_writeback_meta_e = s1_meta_read_value(s1_victim_way_idx.bits)
@@ -761,8 +767,7 @@ class BoomNonBlockingTCacheModule(
         val uop = s1_op.uop
         available_mshr.req_op.valid := 
             s1_op_valid && op_is_still_valid(s1_op) && !op_is_write_killed(s1_op)
-        available_mshr.req_op.bits := s1_op
-        available_mshr.req_op.bits.uop.br_mask := GetNewBrMask(io.core.brupdate, uop)
+        available_mshr.req_op.bits := UpdateBrMask(io.core.brupdate, s1_op)
     }
 
     /* ~* Stage 2 *~ */
@@ -773,6 +778,15 @@ class BoomNonBlockingTCacheModule(
     val s2_op_valid = RegNext(
         s1_op_valid && 
         op_is_still_valid(s1_op) && !op_is_write_killed(s1_op)
+    )
+    /*
+    Since meta and data are written in different cycles, we cannot allow a fill
+    which has touched metadata to be killed going into S2 as it means we would
+    only write to meta and not data, leading to cache corruption. This shouldn't
+    matter for tag write operations as they should never be killed.
+    */
+    val s2_s1_wrote_metadata = RegNext(
+        s1_is_writing_metadata
     )
     val s2_op_type = s2_op.requestType
     val s2_hit = RegNext(s1_hit)
@@ -902,7 +916,7 @@ class BoomNonBlockingTCacheModule(
     // Reshape the request to be a vector like the array
     val s2_op_data = Wire(Vec(mteTagsPerBlock, UInt(MTEConfig.tagBits.W)))
     s2_op_data := s2_op.data.asTypeOf(s2_op_data)
-    when(s2_op_valid &&
+    when((s2_op_valid || s2_s1_wrote_metadata) &&
                s2_op_type === TCacheRequestTypeEnum.WRITE && s2_hit) {
         /* Mask the write so we only hit the appropriate tag */
         val offset = Cat(s2_op.address.bits.address(s2_op.cacheOffsetBits, 0), 
@@ -912,7 +926,7 @@ class BoomNonBlockingTCacheModule(
             s2_op.data(MTEConfig.tagBits - 1, 0)
         })
                               
-    } .elsewhen(s2_op_valid &&
+    } .elsewhen((s2_op_valid || s2_s1_wrote_metadata) &&
                 TCacheRequestTypeEnum.is_replay(s2_op_type)) {
         /* Replays are line fills, so dump the entire data argument in */
         s2_data_wmask := VecInit(Seq.fill(mteTagsPerBlock)(true.B))
@@ -925,6 +939,7 @@ class BoomNonBlockingTCacheModule(
     dontTouch(s2_data_widx)
     dontTouch(s2_data_wdata)
     dontTouch(s2_data_wmask)
+    dontTouch(s2_s1_wrote_metadata)
     dataArrays.write(
         s2_data_widx,
         s2_data_wdata,
