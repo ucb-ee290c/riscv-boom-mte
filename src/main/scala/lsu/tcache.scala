@@ -463,6 +463,7 @@ class BoomNonBlockingTCacheModule(
         /* If S2 is nacking a write, all younger writes need to be killed */
         s2_write_kill_broadcast && op.requestType === TCacheRequestTypeEnum.WRITE
     }
+    
     def op_is_still_valid(op:TCacheOperation):Bool = {
         !IsKilledByBranch(io.core.brupdate, op.uop) &&
         !(io.core.exception && op.uop.uses_ldq) &&
@@ -470,6 +471,13 @@ class BoomNonBlockingTCacheModule(
     }
 
     /* ~* Stage 0 *~ */
+    /* 
+    forward declared wires for hazard detection. We need these otherwise we get
+    funky null pointer exceptions on elaboration
+    */
+    val s0_s1_op = Wire(new TCacheOperation()(p, tcacheParams))
+    val s0_s1_op_valid = Wire(Bool())
+    val s0_s1_is_writing_metadata = Wire(Bool())
 
     /* Decode the incoming request */
     val s0_incoming_req = io.lsu.req
@@ -520,27 +528,56 @@ class BoomNonBlockingTCacheModule(
         printf("[tcache] decoded tag storage address -> %x (tag=%x, idx=%x, offset=%x, sel=%x) uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d. type=%d, data=%x [tsc=%d]\n", s0_op.address.bits.address, s0_op.address.bits.addressTag, s0_op.address.bits.addressIndex, s0_op.address.bits.addressOffset,  s0_op.address.bits.subByteTagSelect, s0_op.uop.uses_ldq, s0_op.uop.ldq_idx, s0_op.uop.uses_stq, s0_op.uop.stq_idx, s0_op.requestType.asUInt, s0_op.data, io.core.tsc_reg)
     }
 
+    /*
+    Reading the same address that is currently being written by an SRAM is
+    undefined. Out of an abundance of caution (prevent write stability issues),
+    we completely suppress reads with conflicting writes rather than simply
+    ignoring the data. As such, we need to nack kill the operation in S0.
+
+    The only operation which generates a hazard for us is the operation directly
+    in front of us (i.e. S1) as it can be writing to meta while we're in S0 and
+    to data in S2 while we're in S1. 
+
+    As back to back writes to the same line are extremely common (i.e. linearly
+    setting the tag), we have a special carve out which allows these hazarded
+    operations to skip hitting (and thus reading the hazarded metadata) by
+    forwarding. This is an important performance optimization as normally back
+    to back writes leads to the two younger writes both being nacked as S2 kills
+    S1 (hazard) and S1 nacks S0 (write nack kill). With the LSU's commit method,
+    this means back to back writes take four serial cycles. We don't want this.
+    */
+    val s0_idx_matches_s1 = s0_s1_op.address.bits.addressIndex === s0_op.address.bits.addressIndex
+    val s0_is_meta_forwarding = 
+        s0_s1_op_valid && 
+        s0_idx_matches_s1 &&
+        s0_s1_is_writing_metadata
+
+
     /* ~* Stage 1 *~ */
-    val s1_op = RegNext(s0_op)
-    s1_op.uop.br_mask := GetNewBrMask(io.core.brupdate, s0_op.uop)
+    val s1_op = RegNext(UpdateBrMask(io.core.brupdate, s0_op))
     val s1_op_valid = RegNext(
         s0_op_valid && op_is_still_valid(s0_op) && !op_is_write_killed(s0_op)
     )
-        
-    val s1_meta_read_value = Wire(Vec(tcacheParams.nWays, metaT))
+
+    val s1_is_meta_forwarding = RegNext(s0_is_meta_forwarding)
+    val s1_sram_meta_read_value = Wire(Vec(tcacheParams.nWays, metaT))
+    val s1_meta_forwarding_value = Reg(Vec(tcacheParams.nWays, metaT))
+
     /* 
     forward declared wires for hazard detection. We need these otherwise we get
     funky null pointer exceptions on elaboration
     */
     val s1_s2_op = Wire(new TCacheOperation()(p, tcacheParams))
     val s1_s2_op_valid = Wire(Bool())
-    val s1_s2_nack = Wire(Bool())
+    val s1_s2_way_index = Wire(UInt(log2Ceil(tcacheParams.nWays).W))
+    val s1_s2_is_writing_data = Wire(Bool())
 
     /* We always need to access meta but don't always care to read data */
-    s1_meta_read_value := metaArrays.read(
+    s1_sram_meta_read_value := metaArrays.read(
         s0_op.address.bits.addressIndex, 
         s0_op_valid && s0_op.address.valid
     ).map{ _.asTypeOf(metaT) }
+    val s1_meta_read_value = Mux(s1_is_meta_forwarding, s1_meta_forwarding_value, s1_sram_meta_read_value)
 
     /* 
     If a request for this same line is already missed out, we want to block the
@@ -583,44 +620,44 @@ class BoomNonBlockingTCacheModule(
                         (s1_op.requestType === TCacheRequestTypeEnum.READ || 
                          s1_op.requestType === TCacheRequestTypeEnum.WRITE) 
     
-    /*
-    Since the read result of simultaneously writing and reading the same address
-    on an array is undefined, we nack any operations which will have either
-    generated a hazard. The only op that could pose a hazard to us is the one
-    currently in S2 because when we were in S0 it was writing meta in S1 (hazard)
-    and now that we're in S1 it is writing the data we want to read in S2.
-    */
-    val s1_hazard_blocked = Wire(Bool())
+    // /*
+    // Since the read result of simultaneously writing and reading the same address
+    // on an array is undefined, we nack any operations which will have either
+    // generated a hazard. The only op that could pose a hazard to us is the one
+    // currently in S2 because when we were in S0 it was writing meta in S1 (hazard)
+    // and now that we're in S1 it is writing the data we want to read in S2.
+    // */
+    // val s1_hazard_blocked = Wire(Bool())
 
-    /* We only have a hazard if they targeted the same record as us */
-    val s1_idx_matches_s2 = s1_s2_op.address.bits.addressIndex === s1_op.address.bits.addressIndex
-    when (!s1_s2_op_valid) {
-        /* Trivially hazard free -- nothing should be happening here */
-        s1_hazard_blocked := false.B
-    } .elsewhen (s1_s2_op.requestType === TCacheRequestTypeEnum.WRITE) {
-        /*
-        TODO: We might actually be able to get craftier and allow back to back
-        writes so long as we're sure metadata won't be corrupted.
-        */
-        /* The hazard only exists if the write actually happened */
-        s1_hazard_blocked := !s1_s2_nack && s1_idx_matches_s2
-    } .elsewhen (TCacheRequestTypeEnum.is_replay(s1_s2_op.requestType)) {
-        /* 
-        If the previous operation was a replay, our entire metadata is undefined
-        and so there's not much we can do.
-        */ 
-        s1_hazard_blocked := s1_idx_matches_s2
-    } .otherwise {
-        /* 
-        All other request types either don't flow down this pipeline or do not
-        write
-        */
-        s1_hazard_blocked := false.B
-    }
+    // /* We only have a hazard if they targeted the same record as us */
+    // val s1_idx_matches_s2 = s1_s2_op.address.bits.addressIndex === s1_op.address.bits.addressIndex
+    // when (!s1_s2_op_valid) {
+    //     /* Trivially hazard free -- nothing should be happening here */
+    //     s1_hazard_blocked := false.B
+    // } .elsewhen (s1_s2_op.requestType === TCacheRequestTypeEnum.WRITE) {
+    //     /*
+    //     TODO: We might actually be able to get craftier and allow back to back
+    //     writes so long as we're sure metadata won't be corrupted.
+    //     */
+    //     /* The hazard only exists if the write actually happened */
+    //     s1_hazard_blocked := !s1_s2_nack && s1_idx_matches_s2
+    // } .elsewhen (TCacheRequestTypeEnum.is_replay(s1_s2_op.requestType)) {
+    //     /* 
+    //     If the previous operation was a replay, our entire metadata is undefined
+    //     and so there's not much we can do.
+    //     */ 
+    //     s1_hazard_blocked := s1_idx_matches_s2
+    // } .otherwise {
+    //     /* 
+    //     All other request types either don't flow down this pipeline or do not
+    //     write
+    //     */
+    //     s1_hazard_blocked := false.B
+    // }
     val s1_nack = 
         (s1_needs_miss && !available_mshr.req_op.ready) || 
-        s1_mshr_blocked ||
-        s1_hazard_blocked
+        s1_mshr_blocked 
+        // || s1_hazard_blocked
     
     // The index to read to get the data for the hit way
     val s1_hit_data_array_idx = 
@@ -628,7 +665,8 @@ class BoomNonBlockingTCacheModule(
 
     /* Handle metadata write */
     val s1_meta_wmask = Wire(Vec(tcacheParams.nWays, Bool()))
-    val s1_meta_wdata = Wire(Vec(tcacheParams.nWays, UInt(metaT.getWidth.W)))
+    val s1_meta_wdata = Wire(Vec(tcacheParams.nWays, metaT))
+    s1_meta_wdata := s1_meta_read_value
     
     // The index of our victim if we evicted someone.
     val s1_victim_way_idx = Wire(Valid(UInt(log2Ceil(tcacheParams.nWays).W)))
@@ -643,10 +681,7 @@ class BoomNonBlockingTCacheModule(
         s1_meta_wmask := s1_way_hit_map
         
         // Update the hit meta entry to reflect that it was dirtied
-        val new_meta = Wire(metaT)
-        new_meta := s1_meta_read_value(s1_way_hit_idx)
-        new_meta.dirty := true.B
-        s1_meta_wdata := VecInit(Seq.fill(tcacheParams.nWays)(new_meta.asUInt))
+        s1_meta_wdata(s1_way_hit_idx).dirty := true.B
 
         s1_is_writing_metadata := true.B
     }.elsewhen (s1_op_valid && !s1_nack &&
@@ -665,34 +700,41 @@ class BoomNonBlockingTCacheModule(
         ).asBools
 
         /* Insert the new meta entry */
-        val new_meta = Wire(metaT)
-        new_meta.cacheTag.valid := true.B
-        new_meta.cacheTag.bits  := s1_op.address.bits.addressTag
+        val meta_e = s1_meta_wdata(s1_victim_way_idx.bits)
+        meta_e.cacheTag.valid := true.B
+        meta_e.cacheTag.bits  := s1_op.address.bits.addressTag
         /* 
         The entry must be inserted dirty if this is a write replay since the
         data we're inserting here actually includes the updated data already
         */
-        new_meta.dirty := s1_op.requestType === TCacheRequestTypeEnum.REPLAY_WRITE
-        s1_meta_wdata := VecInit(Seq.fill(tcacheParams.nWays)(new_meta.asUInt))
+        meta_e.dirty := s1_op.requestType === TCacheRequestTypeEnum.REPLAY_WRITE
 
         s1_is_writing_metadata := true.B
     }.otherwise {
         /* We're not writing to meta, mask off the write */
         s1_meta_wmask := VecInit(Seq.fill(tcacheParams.nWays)(false.B))
-        s1_meta_wdata := DontCare
 
         s1_is_writing_metadata := false.B
     }
 
     metaArrays.write(
         s1_op.address.bits.addressIndex,
-        s1_meta_wdata,
+        VecInit(s1_meta_wdata.map { _.asUInt }),
         s1_meta_wmask
     )
+
+    s1_meta_forwarding_value := s1_meta_wdata
+    val s1_debug_did_write_metadata = RegNext(s1_is_writing_metadata)
+    assert(!s1_op_valid || !s1_is_meta_forwarding || s1_nack || s1_debug_did_write_metadata,
+            "S1 trying to forward metadata when nothing was previously written?")
+
+
     dontTouch(s1_op.address.bits.addressIndex)
     dontTouch(s1_meta_wdata)
     dontTouch(s1_meta_wmask)
     dontTouch(s1_is_writing_metadata)
+    dontTouch(s1_meta_forwarding_value)
+    dontTouch(s1_is_meta_forwarding)
 
     /* Handle writebacks */
     val s1_replay_writeback_meta_e = s1_meta_read_value(s1_victim_way_idx.bits)
@@ -709,18 +751,28 @@ class BoomNonBlockingTCacheModule(
     /* Drive the data array read port for S2 */
     val s1_data_array_enable = Wire(Bool())
     val s1_data_array_idx = Wire(UInt(log2Ceil(dataArraysEntries).W))
+
+    val s1_data_address_matches_s2 = 
+        s1_data_array_idx === Cat(s1_s2_op.address.bits.addressIndex, s1_s2_way_index)
+    val s1_is_data_forwarding = 
+        s1_s2_op_valid &&
+        s1_data_address_matches_s2 &&
+        s1_s2_is_writing_data
+
     s1_data_array_enable := false.B
     s1_data_array_idx := DontCare
     when (s1_op_valid) {
         when (s1_replay_needs_writeback) {
-            s1_data_array_enable := true.B
+            s1_data_array_enable := !s1_is_data_forwarding
             s1_data_array_idx := s1_replay_writeback_data_array_idx
         } .elsewhen(s1_op.requestType === TCacheRequestTypeEnum.READ &&
                     s1_op.address.valid && s1_hit) {
-            s1_data_array_enable := true.B
+            s1_data_array_enable := !s1_is_data_forwarding
             s1_data_array_idx := s1_hit_data_array_idx
         } 
     }
+    
+
 
     /* Handle MSHR dispatch */
     when (s1_replay_needs_writeback) {
@@ -770,11 +822,15 @@ class BoomNonBlockingTCacheModule(
         available_mshr.req_op.bits := UpdateBrMask(io.core.brupdate, s1_op)
     }
 
+    s0_s1_op := s1_op
+    s0_s1_op_valid := s1_op_valid
+    s0_s1_is_writing_metadata := s1_is_writing_metadata
+
     /* ~* Stage 2 *~ */
 
     val s2_op = RegNext(s1_op)
     s2_op.uop.br_mask := GetNewBrMask(io.core.brupdate, s1_op.uop)
-
+    val s2_is_data_forwarding = RegNext(s1_is_data_forwarding)
     val s2_op_valid = RegNext(
         s1_op_valid && 
         op_is_still_valid(s1_op) && !op_is_write_killed(s1_op)
@@ -795,14 +851,12 @@ class BoomNonBlockingTCacheModule(
     val s2_victim_way_idx = RegNext(s1_victim_way_idx)
     val s2_debug_needs_miss = RegNext(s1_needs_miss)
 
-    s1_s2_op_valid := s2_op_valid
-    s1_s2_op := s2_op
-    s1_s2_nack := s2_nack
-
-    s2_data_read_value := dataArrays.read(
+    val s2_sram_data_read_value = dataArrays.read(
         s1_data_array_idx, 
         s1_data_array_enable
     )
+    val s2_sram_data_forwarding_value = Reg(dataArrays.t)
+    s2_data_read_value := Mux(s2_is_data_forwarding, s2_sram_data_forwarding_value, s2_sram_data_read_value)
 
     /*
     Contract: when a write nacks, kill all younger writes in the pipeline with a
@@ -913,6 +967,8 @@ class BoomNonBlockingTCacheModule(
     val s2_data_widx = Cat(s2_op.address.bits.addressIndex, s2_data_wway_idx)
     val s2_data_wmask = Wire(Vec(mteTagsPerBlock, Bool()))
     val s2_data_wdata = Wire(dataArrays.t)
+    val s2_is_writing_data = Wire(Bool())
+    s2_is_writing_data := false.B
     // Reshape the request to be a vector like the array
     val s2_op_data = Wire(Vec(mteTagsPerBlock, UInt(MTEConfig.tagBits.W)))
     s2_op_data := s2_op.data.asTypeOf(s2_op_data)
@@ -925,12 +981,13 @@ class BoomNonBlockingTCacheModule(
         s2_data_wdata := VecInit(Seq.fill(mteTagsPerBlock){
             s2_op.data(MTEConfig.tagBits - 1, 0)
         })
-                              
+        s2_is_writing_data := true.B
     } .elsewhen((s2_op_valid || s2_s1_wrote_metadata) &&
                 TCacheRequestTypeEnum.is_replay(s2_op_type)) {
         /* Replays are line fills, so dump the entire data argument in */
         s2_data_wmask := VecInit(Seq.fill(mteTagsPerBlock)(true.B))
         s2_data_wdata := s2_op_data
+        s2_is_writing_data := true.B
     } .otherwise {
         s2_data_wmask := VecInit(Seq.fill(mteTagsPerBlock)(false.B))
         s2_data_wdata := DontCare
@@ -945,6 +1002,15 @@ class BoomNonBlockingTCacheModule(
         s2_data_wdata,
         s2_data_wmask
     )
+    s2_sram_data_forwarding_value := s2_data_wdata
+    val s2_debug_did_write_data = RegNext(s2_is_writing_data)
+    assert(!s2_op_valid || !s2_is_data_forwarding || s2_nack || s2_debug_did_write_data,
+            "S2 trying to forward data when nothing was previously written?")
+
+    s1_s2_op := s2_op
+    s1_s2_op_valid := s2_op_valid
+    s1_s2_way_index := s2_data_wway_idx
+    s1_s2_is_writing_data := s2_is_writing_data
 }
 
 class TCacheMSHRIO(implicit p: Parameters, tcacheParams: TCacheParams) 
