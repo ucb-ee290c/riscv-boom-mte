@@ -33,6 +33,16 @@ class WithBoomCommitLogPrintf extends Config((site, here, up) => {
   }
 })
 
+class WithBoomMemtracePrintf extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+      enableMemtracePrintf = true
+    )))
+    case other => other
+  }
+})
+
+
 
 class WithBoomBranchPrintf extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
@@ -526,84 +536,50 @@ class WithSWBPD extends Config((site, here, up) => {
   }
 })
 
-/**
- * 1-wide BOOM with MTE support.
- */
-class WithNSmallMTEBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends Config(
-  new WithTAGELBPD ++ // Default to TAGE-L BPD
-  new Config((site, here, up) => {
-    case TilesLocated(InSubsystem) => {
-      val prev = up(TilesLocated(InSubsystem), site)
-      val idOffset = overrideIdOffset.getOrElse(prev.size)
-      (0 until n).map { i =>
-        BoomTileAttachParams(
-          tileParams = BoomTileParams(
-            core = BoomCoreParams(
-              // fetchWidth = 4,
-              // decodeWidth = 1,
-              // numRobEntries = 32,
-              // issueParams = Seq(
-              //   IssueParams(issueWidth=1, numEntries=8, iqType=IQT_MEM.litValue, dispatchWidth=1),
-              //   IssueParams(issueWidth=1, numEntries=8, iqType=IQT_INT.litValue, dispatchWidth=1),
-              //   IssueParams(issueWidth=1, numEntries=8, iqType=IQT_FP.litValue , dispatchWidth=1)),
-              // numIntPhysRegisters = 52,
-              // numFpPhysRegisters = 48,
-              // numLdqEntries = 8,
-              // numStqEntries = 8,
-              // maxBrCount = 8,
-              // numFetchBufferEntries = 8,
-              // ftq = FtqParameters(nEntries=16),
-              // nPerfCounters = 2,
-              // fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true)),
-              fetchWidth = 4,
-              decodeWidth = 2,
-              numRobEntries = 64,
-              issueParams = Seq(
-                IssueParams(issueWidth=1, numEntries=12, iqType=IQT_MEM.litValue, dispatchWidth=2),
-                IssueParams(issueWidth=2, numEntries=20, iqType=IQT_INT.litValue, dispatchWidth=2),
-                IssueParams(issueWidth=1, numEntries=16, iqType=IQT_FP.litValue , dispatchWidth=2)),
-              numIntPhysRegisters = 80,
-              numFpPhysRegisters = 64,
-              numLdqEntries = 16,
-              numStqEntries = 16,
-              maxBrCount = 12,
-              numFetchBufferEntries = 16,
-              ftq = FtqParameters(nEntries=32),
-              nPerfCounters = 6,
-              fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true)),
-              enableCommitLogPrintf = true,
-              useMTE = true,
-              mteRegions = List(
-                /* Region 0 = default DRAM */
-                //TODO: Add support for overriding this/put safer defaults
-                BoomMTERegion(
-                  base = 0x80000000L,
-                  size = 268435456
-                )
-              ),
-              enableMemtracePrintf = true
-            ),
-            dcache = Some(
-              DCacheParams(rowBits = site(SystemBusKey).beatBits, nSets=64, nWays=4, nMSHRs=2, nTLBWays=8)
-            ),
-            icache = Some(
-              ICacheParams(rowBits = site(SystemBusKey).beatBits, nSets=64, nWays=4, fetchBytes=2*4)
-            ),
-            tcache = Some (
-              TCacheParams(
-                nSets = 8,
-                nWays = 2,
-                blockSizeBytes = 8,
-                nMSHRs = 4
-              )
-            ),
-            hartId = i + idOffset
-          ),
-          crossingParams = RocketCrossingParams()
+class WithBoomSmallBPD extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+      bpdMaxMetaLength = 50,
+      globalHistoryLength = 16,
+      localHistoryLength = 1,
+      localHistoryNSets = 0,
+      branchPredictor = ((resp_in: BranchPredictionBankResponse, p: Parameters) => {
+        // gshare is just variant of TAGE with 1 table
+        val gshare = Module(new TageBranchPredictorBank(
+          BoomTageParams(tableInfo = Seq((256, 16, 7)))
+        )(p))
+        val btb = Module(new BTBBranchPredictorBank()(p))
+        val bim = Module(new BIMBranchPredictorBank()(p))
+        val ubtb = Module(new FAMicroBTBBranchPredictorBank()(p))
+        val preds = Seq(ubtb, bim, btb, gshare)
+        preds.map(_.io := DontCare)
+
+        ubtb.io.resp_in(0)  := resp_in
+        bim.io.resp_in(0)   := ubtb.io.resp
+        btb.io.resp_in(0)  := bim.io.resp
+        gshare.io.resp_in(0) := btb.io.resp
+        (preds, gshare.io.resp)
+      })
+    )))
+    case other => other
+  }
+})
+
+class WithBoomMTE(mteRegions:List[BoomMTERegion], nSets:Int = 8, nWays:Int = 2, nMSHRs:Int = 4) extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(
+      core = tp.tileParams.core.copy(
+        useMTE = true,
+        mteRegions = mteRegions
+      ),
+      tcache = Some (
+        TCacheParams(
+          nSets = nSets,
+          nWays = nWays,
+          nMSHRs = nMSHRs
         )
-      } ++ prev
-    }
-    case SystemBusKey => up(SystemBusKey, site).copy(beatBytes = 8)
-    case XLen => 64
-  })
-)
+      )
+    ))
+    case other => other
+  }
+})
