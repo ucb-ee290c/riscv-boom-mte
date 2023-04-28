@@ -339,6 +339,14 @@ class BoomNonBlockingTCacheModule(
     val s2_data_read_value = Wire(Vec(mteTagsPerBlock, UInt(MTEConfig.tagBits.W)))
     /* Broadcast signal to the other stages that S2 is nack-killing all writes */
     val s2_write_kill_broadcast = Wire(Bool())
+    /* 
+    On POR we need to mark all metadata entries as invalid to prevent garbage
+    from being flushed
+    */
+    val is_running_por = RegInit(true.B)
+    val por_meta_i = RegInit(0.U(log2Ceil(tcacheParams.nSets).W))
+    dontTouch(is_running_por)
+    dontTouch(por_meta_i)
 
     /*
     ~* Miss Status Handler Registers *~
@@ -391,7 +399,7 @@ class BoomNonBlockingTCacheModule(
     MSHR to handle a miss.
     */
     val s0_is_executing_replay = Wire(Bool())
-    io.lsu.req.ready := !s0_is_executing_replay
+    io.lsu.req.ready := !s0_is_executing_replay && !is_running_por
 
     when (io.lsu.req.fire) {
         printf("[tcache] accepted request for addr=0x%x, op=%d [tsc=%d]\n", io.lsu.req.bits.address, io.lsu.req.bits.requestType.asUInt, io.core.tsc_reg)
@@ -567,7 +575,8 @@ class BoomNonBlockingTCacheModule(
     /* ~* Stage 1 *~ */
     val s1_op = RegNext(UpdateBrMask(io.core.brupdate, s0_op))
     val s1_op_valid = RegNext(
-        s0_op_valid && op_is_still_valid(s0_op) && !op_is_write_killed(s0_op)
+        s0_op_valid && op_is_still_valid(s0_op) && !op_is_write_killed(s0_op),
+        init = false.B
     )
 
     val s1_is_meta_forwarding = RegNext(s0_is_meta_forwarding)
@@ -675,6 +684,8 @@ class BoomNonBlockingTCacheModule(
         Cat(s1_op.address.bits.addressIndex, s1_way_hit_idx)
 
     /* Handle metadata write */
+    val s1_meta_waddr = Wire(UInt(log2Ceil(tcacheParams.nSets).W))
+    s1_meta_waddr := s1_op.address.bits.addressIndex
     val s1_meta_wmask = Wire(Vec(tcacheParams.nWays, Bool()))
     val s1_meta_wdata = Wire(Vec(tcacheParams.nWays, metaT))
     s1_meta_wdata := s1_meta_read_value
@@ -685,7 +696,26 @@ class BoomNonBlockingTCacheModule(
     s1_victim_way_idx.bits := DontCare
 
     val s1_is_writing_metadata = Wire(Bool())
-    when (s1_op_valid && !s1_nack &&
+    when (is_running_por) {
+        s1_meta_waddr := por_meta_i
+
+        /* Mark all ways as invalid */
+        s1_meta_wmask := VecInit(Seq.fill(tcacheParams.nWays)(true.B))
+        for (i <- 0 until tcacheParams.nWays) {
+            val e = s1_meta_wdata(i)
+            e.cacheTag.valid := false.B
+            e.cacheTag.bits := DontCare
+            e.dirty := DontCare
+        }
+
+        /* Advance or release from POR */
+        s1_is_writing_metadata := true.B
+        when (por_meta_i =/= (tcacheParams.nSets - 1).U) {
+            por_meta_i := por_meta_i + 1.U;
+        } .otherwise {
+            is_running_por := false.B
+        }
+    } .elsewhen (s1_op_valid && !s1_nack &&
           s1_op.requestType === TCacheRequestTypeEnum.WRITE && s1_hit) {
         /* Write hit. We simply need to mark the line as dirty */
         // Write to the way we hit
@@ -695,7 +725,7 @@ class BoomNonBlockingTCacheModule(
         s1_meta_wdata(s1_way_hit_idx).dirty := true.B
 
         s1_is_writing_metadata := true.B
-    }.elsewhen (s1_op_valid && !s1_nack &&
+    } .elsewhen (s1_op_valid && !s1_nack &&
                 TCacheRequestTypeEnum.is_replay(s1_op.requestType)) {
         /*
         Replays are generated for misses and so we need to pick a victim and
@@ -721,7 +751,7 @@ class BoomNonBlockingTCacheModule(
         meta_e.dirty := s1_op.requestType === TCacheRequestTypeEnum.REPLAY_WRITE
 
         s1_is_writing_metadata := true.B
-    }.otherwise {
+    } .otherwise {
         /* We're not writing to meta, mask off the write */
         s1_meta_wmask := VecInit(Seq.fill(tcacheParams.nWays)(false.B))
 
@@ -729,7 +759,7 @@ class BoomNonBlockingTCacheModule(
     }
 
     metaArrays.write(
-        s1_op.address.bits.addressIndex,
+        s1_meta_waddr,
         VecInit(s1_meta_wdata.map { _.asUInt }),
         s1_meta_wmask
     )
@@ -845,7 +875,8 @@ class BoomNonBlockingTCacheModule(
     val s2_is_data_forwarding = RegNext(s1_is_data_forwarding)
     val s2_op_valid = RegNext(
         s1_op_valid && 
-        op_is_still_valid(s1_op) && !op_is_write_killed(s1_op)
+        op_is_still_valid(s1_op) && !op_is_write_killed(s1_op),
+        init = false.B
     )
     /*
     Since meta and data are written in different cycles, we cannot allow a fill
@@ -854,7 +885,8 @@ class BoomNonBlockingTCacheModule(
     matter for tag write operations as they should never be killed.
     */
     val s2_s1_wrote_metadata = RegNext(
-        s1_is_writing_metadata
+        s1_is_writing_metadata,
+        init = false.B
     )
     val s2_op_type = s2_op.requestType
     val s2_hit = RegNext(s1_hit)

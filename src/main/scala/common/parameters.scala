@@ -218,12 +218,6 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     DontCare
   )
 
-  def mteIRTWhiteningKeys = getOrElse(
-    smte_configCSR, 
-    _.value(MTECSRs.smte_config_irtWhiteningKeyShift + MTECSRs.smte_config_irtWhiteningKeyWidth - 1, MTECSRs.smte_config_irtWhiteningKeyShift), 
-    0.U
-  )
-
   def smte_tagbases = smte_tagbaseCSRs.map { csr =>
     getOrElse(Some(csr), _.value(coreMaxAddrBits - 1, 0), DontCare)
   }
