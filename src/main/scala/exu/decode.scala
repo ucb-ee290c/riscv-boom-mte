@@ -490,7 +490,9 @@ object MTEDecode extends DecodeConstants
   MTE_ADD     -> List(Y, N, X, uopMTE_ADD    , IQT_INT, FU_ALU , RT_FIX, RT_FIX, RT_FIX, N, IS_X, N, N, N, N, N, M_X  , 1.U, Y, N, N, N, N, CSR.N),
   // MTE_STTI    -> List(Y, N, X, uopMTE_STTI   , IQT_MEM, FU_MEM , RT_FIX, RT_FIX, RT_X  , N, IS_I, N, Y, N, N, N, M_X  , 0.U, N, N, N, N, N, CSR.N)
   //FIXME: Writeback the generated address
-  MTE_STTI    -> List(Y, N, X, uopMTE_STTI   , IQT_MEM, FU_MEM , RT_X  , RT_FIX, RT_X  , N, IS_I, N, Y, N, N, N, M_X  , 0.U, N, N, N, N, N, CSR.N)
+  MTE_STTI    -> List(Y, N, X, uopMTE_STTI   , IQT_MEM, FU_MEM , RT_X  , RT_FIX, RT_X  , N, IS_I, N, Y, N, N, N, M_X  , 0.U, N, N, N, N, N, CSR.N),
+  MTE_IRT     -> List(Y, N, X, uopMTE_IRT    , IQT_INT, FU_ALU , RT_FIX, RT_FIX, RT_FIX, N, IS_X, N, N, N, N, N, M_X  , 1.U, Y, N, N, N, N, CSR.N),
+
   )
 }
 

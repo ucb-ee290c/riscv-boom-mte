@@ -338,6 +338,14 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     }
   }
 
+  if (useMTE) {
+    exe_units.alu_units.foreach {
+      alu =>
+        alu.io.dprv := csr.io.status.dprv
+    }
+  }
+
+
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
   val icache_blocked = false.B
   csr.io.counters foreach { c => c.inc := RegNext(perfEvents.evaluate(c.eventSel)) }

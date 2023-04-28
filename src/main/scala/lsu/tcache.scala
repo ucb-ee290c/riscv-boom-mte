@@ -467,7 +467,18 @@ class BoomNonBlockingTCacheModule(
     def op_is_still_valid(op:TCacheOperation):Bool = {
         !IsKilledByBranch(io.core.brupdate, op.uop) &&
         !(io.core.exception && op.uop.uses_ldq) &&
-        !(op.uop.uses_stq && io.lsu.st_exc_killed_mask(op.uop.stq_idx))
+        /*
+        Since we early ack writes, a missed to MSHR write can end up having its
+        STQ entry reallocated before the write completes in the cache. If the
+        STQ entry is reallocated as a normal store but is later killed, 
+        st_exc_killed_mask will indicate to us that the tag read operation needs
+        to be killed. We need to make sure, however, that these notifications
+        only actually apply to killable things, which writes are not as they
+        are only launched after commit.
+        */
+        !(op.uop.uses_stq && io.lsu.st_exc_killed_mask(op.uop.stq_idx) && 
+            op.requestType =/= TCacheRequestTypeEnum.WRITE &&
+            op.requestType =/= TCacheRequestTypeEnum.REPLAY_WRITE)
     }
 
     /* ~* Stage 0 *~ */
@@ -765,7 +776,8 @@ class BoomNonBlockingTCacheModule(
         when (s1_replay_needs_writeback) {
             s1_data_array_enable := !s1_is_data_forwarding
             s1_data_array_idx := s1_replay_writeback_data_array_idx
-        } .elsewhen(s1_op.requestType === TCacheRequestTypeEnum.READ &&
+        } .elsewhen((s1_op.requestType === TCacheRequestTypeEnum.READ ||
+                        s1_op.requestType === TCacheRequestTypeEnum.WRITE) &&
                     s1_op.address.valid && s1_hit) {
             s1_data_array_enable := !s1_is_data_forwarding
             s1_data_array_idx := s1_hit_data_array_idx
@@ -855,6 +867,7 @@ class BoomNonBlockingTCacheModule(
         s1_data_array_idx, 
         s1_data_array_enable
     )
+    val s2_debug_data_array_enable = RegNext(s1_data_array_enable)
     val s2_sram_data_forwarding_value = Reg(dataArrays.t)
     s2_data_read_value := Mux(s2_is_data_forwarding, s2_sram_data_forwarding_value, s2_sram_data_read_value)
 
@@ -931,14 +944,18 @@ class BoomNonBlockingTCacheModule(
         Early acks are helpful because it saves clients from needing to wait for
         a possibly very long miss.
         */
-        printf("[tcache] s2 write ack addr=%x, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d (nack=%d, hit=%d, data=%x) [tsc=%d]\n",
+        printf("[tcache] s2 write ack addr=%x, uses_ldq=%d, ldq=%d, uses_stq=%d, stq=%d (addr valid=%d, nack=%d, hit=%d, data=%x) [tsc=%d]\n",
             s2_op.address.bits.address, s2_op.uop.uses_ldq, s2_op.uop.ldq_idx, s2_op.uop.uses_stq, s2_op.uop.stq_idx,
-            s2_nack, s2_hit,
+            s2_op.address.valid, s2_nack, s2_hit,
             s2_op.data,
             io.core.tsc_reg
         )
         resp_v := true.B
-        resp_b.nack := s2_nack
+        /* 
+        If the address isn't valid, this is a write to nowhere. Just ACK it and
+        move on to avoid deadlocking
+        */
+        resp_b.nack := s2_nack && s2_op.address.valid
         resp_b.data := DontCare
 
     } .elsewhen (s2_op_type === TCacheRequestTypeEnum.REPLAY_WRITE) {
@@ -978,9 +995,12 @@ class BoomNonBlockingTCacheModule(
         val offset = Cat(s2_op.address.bits.address(s2_op.cacheOffsetBits, 0), 
                          s2_op.address.bits.subByteTagSelect)
         s2_data_wmask := UIntToOH(offset, mteTagsPerBlock).asBools
-        s2_data_wdata := VecInit(Seq.fill(mteTagsPerBlock){
-            s2_op.data(MTEConfig.tagBits - 1, 0)
-        })
+
+        s2_data_wdata := s2_data_read_value
+        s2_data_wdata(offset) := s2_op_data(0)
+
+        assert(s2_is_data_forwarding || s2_debug_data_array_enable, "S2 is creating invalid forwarding data on a write")
+        
         s2_is_writing_data := true.B
     } .elsewhen((s2_op_valid || s2_s1_wrote_metadata) &&
                 TCacheRequestTypeEnum.is_replay(s2_op_type)) {
@@ -1153,6 +1173,23 @@ class TCacheMSHRModule(
     })
     dontTouch(io.req_op.bits.uop)
 
+    def op_is_still_valid(op:TCacheOperation):Bool = {
+        !IsKilledByBranch(io.brupdate, op.uop) &&
+        !(io.exception && op.uop.uses_ldq) &&
+        /*
+        Since we early ack writes, a missed to MSHR write can end up having its
+        STQ entry reallocated before the write completes in the cache. If the
+        STQ entry is reallocated as a normal store but is later killed, 
+        st_exc_killed_mask will indicate to us that the tag read operation needs
+        to be killed. We need to make sure, however, that these notifications
+        only actually apply to killable things, which writes are not as they
+        are only launched after commit.
+        */
+        !(op.uop.uses_stq && io.st_exc_killed_mask(op.uop.stq_idx) && 
+            op.requestType =/= TCacheRequestTypeEnum.WRITE &&
+            op.requestType =/= TCacheRequestTypeEnum.REPLAY_WRITE)
+    }
+
     val blocked_address_r = Reg(UInt(coreMaxAddrBits.W))
     io.blocked_address.bits := blocked_address_r
 
@@ -1198,9 +1235,7 @@ class TCacheMSHRModule(
     val op_address = op.address
     val op_type = op.requestType
     val op_v = Mux(io.req_op.fire, io.req_op.valid, op_r.valid) &&
-        !IsKilledByBranch(io.brupdate, op.uop) &&
-        !(io.exception && op.uop.uses_ldq) &&
-        !(op.uop.uses_stq && io.st_exc_killed_mask(op.uop.stq_idx))
+        op_is_still_valid(op)
     val executed = Mux(io.req_op.fire, false.B, executed_r && !io.mem.s2_nack)
     
     op_r.valid := op_v &&
@@ -1272,12 +1307,9 @@ class TCacheMSHRModule(
     /* ~* Handle memory response *~ */
     val resp_op_v_r = Reg(Bool())
     val resp_mem_v = io.mem.resp.valid
-    val should_send_resp = op_r.valid && 
+    val should_send_resp = op_r.valid && op_is_still_valid(op_r.bits) &&
         op_r.bits.requestType =/= TCacheRequestTypeEnum.WRITEBACK &&
-        (resp_mem_v || resp_op_v_r) &&
-        !IsKilledByBranch(io.brupdate, op_r.bits.uop) &&
-        !(io.exception && op_r.bits.uop.uses_ldq) &&
-        !(op_r.bits.uop.uses_stq && io.st_exc_killed_mask(op_r.bits.uop.stq_idx))
+        (resp_mem_v || resp_op_v_r) 
         
     val resp_mem_b = io.mem.resp.bits
 
@@ -1288,8 +1320,7 @@ class TCacheMSHRModule(
     // We use op_r here rather than op_v to break the combinational loop
     // we don't need op_v anyways since we'll never be valid in cycle 0
     io.resp_op.valid := should_send_resp
-    resp_op_b := op_r.bits
-    resp_op_b.uop.br_mask := GetNewBrMask(io.brupdate, op_r.bits.uop)
+    resp_op_b := UpdateBrMask(io.brupdate, op_r.bits)
     when (op_r.bits.requestType === TCacheRequestTypeEnum.READ) {
         resp_op_b.requestType := TCacheRequestTypeEnum.REPLAY_READ
     } .elsewhen (op_r.bits.requestType === TCacheRequestTypeEnum.WRITE) {
@@ -1297,7 +1328,7 @@ class TCacheMSHRModule(
     } .elsewhen(op_r.bits.requestType === TCacheRequestTypeEnum.WRITEBACK) {
         resp_op_b.requestType := TCacheRequestTypeEnum.WRITEBACK
     } .otherwise {
-        assert(false.B, "Unexpected request type in MSHR")
+        assert(!op_r.valid, "Unexpected request type in MSHR")
         resp_op_b.requestType := DontCare
     }
 

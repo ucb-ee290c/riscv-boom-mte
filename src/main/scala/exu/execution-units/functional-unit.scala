@@ -22,7 +22,7 @@ import chisel3.util._
 import freechips.rocketchip.config.Parameters
 import freechips.rocketchip.util._
 import freechips.rocketchip.tile
-import freechips.rocketchip.rocket.{PipelinedMultiplier,BP,BreakpointUnit,Causes,CSR}
+import freechips.rocketchip.rocket.{PipelinedMultiplier,BP,BreakpointUnit,Causes,CSR,PRV}
 
 import boom.common._
 import boom.ifu._
@@ -179,6 +179,9 @@ abstract class FunctionalUnit(
 
     val bypass = Output(Vec(numBypassStages, Valid(new ExeUnitResp(dataWidth))))
 
+    // only used by ALU in MTE
+    val dprv    = if (isAluUnit) Input(UInt(PRV.SZ.W)) else null
+
     // only used by the fpu unit
     val fcsr_rm = if (needsFcsr) Input(UInt(tile.FPConstants.RM_SZ.W)) else null
 
@@ -286,7 +289,33 @@ class MTEALUAddOnUnit(dataWidth:Int)(implicit p: Parameters)
       val imm     = Input(UInt(dataWidth.W))
       val out     = Output(UInt(dataWidth.W))
       val valid   = Output(Bool())
+      val dprv    = Input(UInt(PRV.SZ.W))
+      val brupdate = Input(new BrUpdateInfo())
+      // val irt_key_whitening = Input(UInt(MTECSRs.smte_config_irtWhiteningKeyWidth.W))
   })
+
+  val lfsrs = Wire(Vec(4, UInt(4.W)))
+
+  for (i <- 0 until 4) {
+    val lfsr = random.GaloisLFSR.maxPeriod(
+      width = 16,
+      /* 
+      By isolating LFSRs by prv and advancing them at different hard to predict
+      rates, we're able to make breaking the LFSR difficult. 
+      Isolation helps on time sharing systems since a process can't typically
+      know the exact breakdown of time spent in S and U mode of the target, let
+      alone the number of branches at a given ROB index. 
+      It's still not a CSPRNG but there's likely no practical way to do this.
+      */
+      increment = io.dprv === i.U || (
+        io.brupdate.b1.mispredict_mask(i + 1) ^
+        io.req.bits.uop.uopc(i)
+      ),
+      seed = Some(i + 1)
+    )
+    lfsrs(i) := lfsr
+  }
+
 
   val rs1 = io.req.bits.rs1_data
   val rs2 = io.req.bits.rs2_data
@@ -296,8 +325,19 @@ class MTEALUAddOnUnit(dataWidth:Int)(implicit p: Parameters)
     io.valid := true.B
     /* Take the result of the add but preserve the tags from the original Rs1 */
     io.out := Cat(rs1(63, 60), io.alu_out(59, 0))
-  } 
-  .otherwise {
+  } .elsewhen (uopc === uopMTE_IRT) {
+    io.valid := true.B
+
+    // /* Reshape the keys field */
+    // val keys = Wire(Vec(MTECSRs.smte_config_irtWhiteningKeyWidth / MTEConfig.tagBits, UInt(MTEConfig.tagBits.W)))
+    // assert(MTECSRs.smte_config_irtWhiteningKeyWidth / MTEConfig.tagBits == 4, "Unexpected whitening width? Too many ELs?")
+    // keys := io.irt_key_whitening.asTypeOf(keys)
+    // /* Whiten the LFSR output */
+    // val tag = lfsr ^ keys(io.dprv)
+    /* Insert the tag alongside the add result */
+    val tag = lfsrs(io.dprv)(MTEConfig.tagBits - 1, 0)
+    io.out := Cat(tag, io.alu_out(59, 0))
+  } .otherwise {
     io.valid := false.B
     io.out := DontCare
   }
@@ -362,6 +402,8 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
     mteAddOn.io.req     := io.req
     mteAddOn.io.alu_out := alu.io.out
     mteAddOn.io.imm := imm_xprlen.asUInt
+    mteAddOn.io.brupdate := io.brupdate
+    mteAddOn.io.dprv := io.dprv
   }
 
 
