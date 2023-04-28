@@ -836,7 +836,7 @@ val ldq_head_e_mte_phys_mte_tag_pending = ldq_head_e.bits.phys_mte_tag_pending.g
       Mux(will_fire_sta_retry     (w)  , stq_retry_e.bits.addr_mte_tag.get,
                                          0.U))))
     } else {
-      DontCare
+      0.U
     }
   })
 
@@ -964,25 +964,30 @@ val ldq_head_e_mte_phys_mte_tag_pending = ldq_head_e.bits.phys_mte_tag_pending.g
   // Tag Cache Access
   // Launch requests into the tag cache
   def ldq_dump() = {
-    printf("[lsu] ---LDQ DUMP (tsc=%d)\nhead=%d, tail=%d\n", io.core.tsc_reg, ldq_head, ldq_tail)
-    for (i <- 0 until numLdqEntries) {
-      val ldq_e = ldq(i)
-      val ldq_b = ldq_e.bits
-      printf("[lsu] LD.Q %d, valid=%x, addr=%x (V=%d, virtual=%d), addr_mte_tag=%x, phys_mte_tag=%x (V=%d), executed=%d, phys_mte_tag_pending=%d, succeeded=%d, committed=%d, uopc=%d, pc=%x\n",
-        i.U, ldq_e.valid, ldq_b.addr.bits, ldq_b.addr.valid, ldq_b.addr_is_virtual, ldq_b.addr_mte_tag.get, ldq_b.phys_mte_tag.get.bits, ldq_b.phys_mte_tag.get.valid, ldq_b.executed, ldq_b.phys_mte_tag_pending.get, ldq_b.succeeded, ldq_b.committed, ldq_b.uop.uopc, ldq_b.uop.debug_pc)
+    if (useMTE) {
+      printf("[lsu] ---LDQ DUMP (tsc=%d)\nhead=%d, tail=%d\n", io.core.tsc_reg, ldq_head, ldq_tail)
+      for (i <- 0 until numLdqEntries) {
+        val ldq_e = ldq(i)
+        val ldq_b = ldq_e.bits
+        printf("[lsu] LD.Q %d, valid=%x, addr=%x (V=%d, virtual=%d), addr_mte_tag=%x, phys_mte_tag=%x (V=%d), executed=%d, phys_mte_tag_pending=%d, succeeded=%d, committed=%d, uopc=%d, pc=%x\n",
+          i.U, ldq_e.valid, ldq_b.addr.bits, ldq_b.addr.valid, ldq_b.addr_is_virtual, ldq_b.addr_mte_tag.get, ldq_b.phys_mte_tag.get.bits, ldq_b.phys_mte_tag.get.valid, ldq_b.executed, ldq_b.phys_mte_tag_pending.get, ldq_b.succeeded, ldq_b.committed, ldq_b.uop.uopc, ldq_b.uop.debug_pc)
+      }
+      printf("[lsu] ---END\n")
+
     }
-    printf("[lsu] ---END\n")
   }
 
   def stq_dump() = {
-    printf("[lsu] ---STQ DUMP (tsc=%d)\nhead=%d, tail=%d, commit head=%d, execute head=%d\n", io.core.tsc_reg, stq_head, stq_tail, stq_commit_head, stq_execute_head)
-    for (i <- 0 until numStqEntries) {
-      val stq_e = stq(i)
-      val stq_b = stq_e.bits
-      printf("[lsu] ST.Q %d, valid=%x, addr=%x (V=%d, virtual=%d), addr_mte_tag=%x, phys_mte_tag=%x (V=%d), phys_mte_tag_pending=%d, commit_in_flight=%d, succeeded=%d, committed=%d, uopc=%d, pc=%x\n",
-        i.U, stq_e.valid, stq_b.addr.bits, stq_b.addr.valid, stq_b.addr_is_virtual, stq_b.addr_mte_tag.get, stq_b.phys_mte_tag.get.bits, stq_b.phys_mte_tag.get.valid, stq_b.phys_mte_tag_pending.get, stq_b.commit_in_flight, stq_b.succeeded, stq_b.committed, stq_b.uop.uopc, stq_b.uop.debug_pc)
+    if (useMTE) {
+      printf("[lsu] ---STQ DUMP (tsc=%d)\nhead=%d, tail=%d, commit head=%d, execute head=%d\n", io.core.tsc_reg, stq_head, stq_tail, stq_commit_head, stq_execute_head)
+      for (i <- 0 until numStqEntries) {
+        val stq_e = stq(i)
+        val stq_b = stq_e.bits
+        printf("[lsu] ST.Q %d, valid=%x, addr=%x (V=%d, virtual=%d), addr_mte_tag=%x, phys_mte_tag=%x (V=%d), phys_mte_tag_pending=%d, commit_in_flight=%d, succeeded=%d, committed=%d, uopc=%d, pc=%x\n",
+          i.U, stq_e.valid, stq_b.addr.bits, stq_b.addr.valid, stq_b.addr_is_virtual, stq_b.addr_mte_tag.get, stq_b.phys_mte_tag.get.bits, stq_b.phys_mte_tag.get.valid, stq_b.phys_mte_tag_pending.get, stq_b.commit_in_flight, stq_b.succeeded, stq_b.committed, stq_b.uop.uopc, stq_b.uop.debug_pc)
+      }
+      printf("[lsu] ---END\n")
     }
-    printf("[lsu] ---END\n")
   }
   val tcache_addr = widthMap(w =>
                     /* Tag retries already cleared TLB */
@@ -2168,11 +2173,14 @@ val ldq_head_e_mte_phys_mte_tag_pending = ldq_head_e.bits.phys_mte_tag_pending.g
     ldq_dump()
 
     val uop = ldq_head_e.bits.uop
-    printf("[lsu] LDQ %d commit uopc=%x, mem_cmd=%x, addr=%x, addr_tag=%x, phys_tag=%x, ldq_head=%x, ldq_tail=%x [tsc=%d]\n", 
-          ldq_head, uop.uopc, uop.mem_cmd, ldq_head_e.bits.addr.bits, ldq_head_e.bits.addr_mte_tag.get, ldq_head_e.bits.phys_mte_tag.get.bits,
-          ldq_head, ldq_tail,
-          io.core.tsc_reg
-    )
+    if (useMTE) {
+      printf("[lsu] LDQ %d commit uopc=%x, mem_cmd=%x, addr=%x, addr_tag=%x, phys_tag=%x, ldq_head=%x, ldq_tail=%x [tsc=%d]\n", 
+            ldq_head, uop.uopc, uop.mem_cmd, ldq_head_e.bits.addr.bits, ldq_head_e.bits.addr_mte_tag.get, ldq_head_e.bits.phys_mte_tag.get.bits,
+            ldq_head, ldq_tail,
+            io.core.tsc_reg
+      )
+    }
+
 
     ldq_head_e.valid                 := false.B
     ldq_head_e.bits.addr.valid       := false.B
@@ -2230,10 +2238,6 @@ val ldq_head_e_mte_phys_mte_tag_pending = ldq_head_e.bits.phys_mte_tag_pending.g
   when (clear_store)
   {
     val uop = stq_head_e.bits.uop
-    printf("[lsu] STQ %x commit uopc=%x, mem_cmd=%x, addr=%x, addr_tag=%x, phys_tag=%x, stq_head=%x, stq_tail=%x [tsc=%d]\n", 
-          stq_head, uop.uopc, uop.mem_cmd, stq_head_e.bits.addr.bits, stq_head_e.bits.addr_mte_tag.get, stq_head_e.bits.phys_mte_tag.get.bits,
-          stq_head, stq_tail, io.core.tsc_reg
-    )
 
     stq_head_e.valid           := false.B
     stq_head_e.bits.addr.valid := false.B
@@ -2245,6 +2249,10 @@ val ldq_head_e_mte_phys_mte_tag_pending = ldq_head_e.bits.phys_mte_tag_pending.g
         stq_head_e.bits.phys_mte_tag.get.valid := false.B
         stq_head_e.bits.phys_mte_tag.get.bits := 0xa.U
         stq_head_e.bits.phys_mte_tag_pending.get := false.B
+        printf("[lsu] STQ %x commit uopc=%x, mem_cmd=%x, addr=%x, addr_tag=%x, phys_tag=%x, stq_head=%x, stq_tail=%x [tsc=%d]\n", 
+                  stq_head, uop.uopc, uop.mem_cmd, stq_head_e.bits.addr.bits, stq_head_e.bits.addr_mte_tag.get, stq_head_e.bits.phys_mte_tag.get.bits,
+                  stq_head, stq_tail, io.core.tsc_reg
+            )
     }
 
     stq_head := WrapInc(stq_head, numStqEntries)
@@ -2433,6 +2441,7 @@ val ldq_head_e_mte_phys_mte_tag_pending = ldq_head_e.bits.phys_mte_tag_pending.g
       }
     }
 
+    //XXX: This design means that we drop some tag checks on an exception
     for (i <- 0 until numLdqEntries)
     {
       ldq(i).valid           := false.B

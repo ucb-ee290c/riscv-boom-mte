@@ -21,7 +21,7 @@ import chisel3._
 import chisel3.util._
 
 import freechips.rocketchip.config.{Parameters}
-import freechips.rocketchip.rocket.{BP}
+import freechips.rocketchip.rocket.{BP, PRV}
 import freechips.rocketchip.tile.{XLen, RoCCCoreIO}
 import freechips.rocketchip.tile
 
@@ -116,6 +116,7 @@ abstract class ExecutionUnit(
     val bypass   = Output(Vec(numBypassStages, Valid(new ExeUnitResp(dataWidth))))
     val brupdate = Input(new BrUpdateInfo())
 
+    val dprv = if (hasAlu) Input(UInt(PRV.SZ.W)) else null
 
     // only used by the rocc unit
     val rocc = if (hasRocc) new RoCCShimCoreIO else null
@@ -277,6 +278,7 @@ class ALUExeUnit(
     alu.io.req.bits.pred_data := io.req.bits.pred_data
     alu.io.resp.ready := DontCare
     alu.io.brupdate := io.brupdate
+    alu.io.dprv := io.dprv
 
     iresp_fu_units += alu
 

@@ -157,13 +157,15 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
       MTECSRs.widthToMask(MTECSRs.smte_config_enableWidth) << MTECSRs.smte_config_enableShift |
       //TODO: We don't currently support sync and we don't plan to. RAZ/WI
       // MTECSRs.smte_config_enforceSyncMask << MTECSRs.smte_config_enforceSyncShift |
-      MTECSRs.widthToMask(MTECSRs.smte_config_permissiveTagWidth) << MTECSRs.smte_config_permissiveTagShift
+      MTECSRs.widthToMask(MTECSRs.smte_config_permissiveTagWidth) << MTECSRs.smte_config_permissiveTagShift |
+      MTECSRs.widthToMask(MTECSRs.smte_config_irtWhiteningKeyWidth) << MTECSRs.smte_config_irtWhiteningKeyShift
     }
 
     val init = BigInt(
       0 << MTECSRs.smte_config_enableShift |
       0 << MTECSRs.smte_config_enforceSyncShift |
-      0xf << MTECSRs.smte_config_permissiveTagShift
+      0 << MTECSRs.smte_config_permissiveTagShift |
+      0 << MTECSRs.smte_config_irtWhiteningKeyShift
     )
     mteCSRGen(MTECSRs.smte_configID, mask, init)
   }
@@ -208,6 +210,12 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     smte_configCSR,
     _.value(MTECSRs.smte_config_permissiveTagShift + MTECSRs.smte_config_permissiveTagWidth - 1, MTECSRs.smte_config_permissiveTagShift),
     DontCare
+  )
+
+  def mteIRTWhiteningKeys = getOrElse(
+    smte_configCSR, 
+    _.value(MTECSRs.smte_config_irtWhiteningKeyShift + MTECSRs.smte_config_irtWhiteningKeyWidth - 1, MTECSRs.smte_config_irtWhiteningKeyShift), 
+    0.U
   )
 
   def smte_tagbases = smte_tagbaseCSRs.map { csr =>
