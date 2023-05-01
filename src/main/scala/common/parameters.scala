@@ -157,15 +157,13 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
       MTECSRs.widthToMask(MTECSRs.smte_config_enableWidth) << MTECSRs.smte_config_enableShift |
       //TODO: We don't currently support sync and we don't plan to. RAZ/WI
       // MTECSRs.smte_config_enforceSyncMask << MTECSRs.smte_config_enforceSyncShift |
-      MTECSRs.widthToMask(MTECSRs.smte_config_permissiveTagWidth) << MTECSRs.smte_config_permissiveTagShift |
-      MTECSRs.widthToMask(MTECSRs.smte_config_irtWhiteningKeyWidth) << MTECSRs.smte_config_irtWhiteningKeyShift
+      MTECSRs.widthToMask(MTECSRs.smte_config_permissiveTagWidth) << MTECSRs.smte_config_permissiveTagShift
     }
 
     val init = BigInt(
       0 << MTECSRs.smte_config_enableShift |
       0 << MTECSRs.smte_config_enforceSyncShift |
-      0 << MTECSRs.smte_config_permissiveTagShift |
-      0 << MTECSRs.smte_config_irtWhiteningKeyShift
+      0 << MTECSRs.smte_config_permissiveTagShift
     )
     mteCSRGen(MTECSRs.smte_configID, mask, init)
   }

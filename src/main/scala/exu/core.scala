@@ -344,6 +344,7 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
     exe_units.alu_units.foreach {
       alu =>
         alu.io.dprv := csr.io.status.dprv
+        alu.io.mte_permissive_tag := custom_csrs.mtePermissiveTag
     }
   }
 

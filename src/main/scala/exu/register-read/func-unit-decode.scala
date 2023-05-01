@@ -114,9 +114,11 @@ object AluRRdDecode extends RRdDecodeConstants
          BitPat(uopBLTU)  -> List(BR_LTU,Y, N, N, FN_SLTU, DW_XPR, OP1_X   , OP2_X   , IS_B, REN_0, CSR.N),
          
          /* MTE_ADD uses the ALU for add and we simply splice in the tag bits */
-         BitPat(uopMTE_ADD)-> List(BR_N , Y, N, N, FN_ADD, DW_XPR, OP1_RS1 , OP2_RS2 , IS_X, REN_1, CSR.N),
+         BitPat(uopMTE_ADD)   -> List(BR_N , Y, N, N, FN_ADD, DW_XPR, OP1_RS1 , OP2_RS2 , IS_X, REN_1, CSR.N),
          /* IRT adds its arguments and then inserts a random tag */
-         BitPat(uopMTE_IRT)-> List(BR_N , Y, N, N, FN_ADD, DW_XPR, OP1_RS1 , OP2_RS2 , IS_X, REN_1, CSR.N)
+         BitPat(uopMTE_IRT)   -> List(BR_N , Y, N, N, FN_ADD, DW_XPR, OP1_RS1 , OP2_RS2 , IS_X, REN_1, CSR.N),
+         BitPat(uopMTE_ADDTI) -> List(BR_N , Y, N, N, FN_ADD, DW_XPR, OP1_RS1 , OP2_IMMH, IS_I, REN_1, CSR.N),
+         
         )
 }
 
