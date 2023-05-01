@@ -117,6 +117,7 @@ abstract class ExecutionUnit(
     val brupdate = Input(new BrUpdateInfo())
 
     val dprv = if (hasAlu) Input(UInt(PRV.SZ.W)) else null
+    val mte_permissive_tag = if (hasAlu) Input(UInt(MTEConfig.tagBits.W)) else null
 
     // only used by the rocc unit
     val rocc = if (hasRocc) new RoCCShimCoreIO else null
@@ -278,7 +279,10 @@ class ALUExeUnit(
     alu.io.req.bits.pred_data := io.req.bits.pred_data
     alu.io.resp.ready := DontCare
     alu.io.brupdate := io.brupdate
-    alu.io.dprv := io.dprv
+    if (useMTE) {
+      alu.io.dprv := io.dprv
+      alu.io.mte_permissive_tag := io.mte_permissive_tag
+    }
 
     iresp_fu_units += alu
 
