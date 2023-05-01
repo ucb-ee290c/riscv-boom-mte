@@ -9,24 +9,27 @@ object MTEConfig {
 }
 
 object MTEInstructions {
-    /*
-     * The custom-3 RISCV space uses opcode 1111011. We are free to dice it 
-     * however we see fit, but we follow (roughly) the default convention for
-     * reuse of Rd, Rs1, Rs2 decoding.
-     * 
-     * Conventions:
-     * R-type uses funct3 = 3'b111 and funct7 to differentiate ops
-     */
+/*
+    * The custom-3 RISCV space uses opcode 1111011. We are free to dice it 
+    * however we see fit, but we follow (roughly) the default convention for
+    * reuse of Rd, Rs1, Rs2 decoding.
+    * 
+    * Conventions:
+    * R-type uses funct3 = 3'b111 and funct7 to differentiate ops
+    */
 
-     /* R-types */
-     /* mte.add is funct7 = 7'b0 */
-     def MTE_ADD            = BitPat("b0000000_?????_?????_111_?????_1111011")
+    /* R-types */
+    /* mte.add is funct7 = 7'b0 */
+    def MTE_ADD            = BitPat("b0000000_?????_?????_111_?????_1111011")
+    /* mte.irt is funct7 = 7'b1 */
+    def MTE_IRT            = BitPat("b0000001_?????_?????_111_?????_1111011")
+    /* S-types */
+    /* mte.stti is funct3 = 3'b101 */
+    def MTE_STTI           = BitPat("b????????????_?????_101_?????_1111011")
+    /* I-types */
+    /* mte.addti is funct3 = 3'b110 */
+    def MTE_ADDTI          = BitPat("b????????????_?????_110_?????_1111011")
 
-     /* I-types */
-     /* mte.addti is funct3 = 3'b110 */
-     def MTE_ADDTI          = BitPat("b????????????_?????_110_?????_1111011")
-     /* mte.stti is funct3 = 3'b101 */
-     def MTE_STTI           = BitPat("b????????????_?????_101_?????_1111011")
 //   def CUSTOM3            = BitPat("b?????????????????000?????1111011")
 //   def CUSTOM3_RS1        = BitPat("b?????????????????010?????1111011")
 //   def CUSTOM3_RS1_RS2    = BitPat("b?????????????????011?????1111011")
@@ -77,12 +80,12 @@ object MTECSRs {
     def widthToMask(width:Int):BigInt = {
         (BigInt(1) << width) - 1
     }
-    def smte_config_enableShift         =   0
-    def smte_config_enableWidth         =   4
-    def smte_config_enforceSyncShift    =   smte_config_enableShift + smte_config_enableWidth
-    def smte_config_enforceSyncWidth    =   4
-    def smte_config_permissiveTagShift  =   smte_config_enforceSyncShift + smte_config_enforceSyncWidth
-    def smte_config_permissiveTagWidth  =   4
+    def smte_config_enableShift          =   0
+    def smte_config_enableWidth          =   4
+    def smte_config_enforceSyncShift     =   smte_config_enableShift + smte_config_enableWidth
+    def smte_config_enforceSyncWidth     =   4
+    def smte_config_permissiveTagShift   =   smte_config_enforceSyncShift + smte_config_enforceSyncWidth
+    def smte_config_permissiveTagWidth   =   4
 
     def smte_fstatus_validShift         =  0
     def smte_fstatus_validWidth         =  1

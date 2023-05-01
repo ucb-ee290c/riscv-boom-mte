@@ -89,6 +89,7 @@ trait ScalarOpConstants
   val OP2_ZERO= 2.U(3.W) // constant 0
   val OP2_NEXT= 3.U(3.W) // constant 2/4 (for PC+2/4)
   val OP2_IMMC= 4.U(3.W) // for CSR imm found in RS1
+  val OP2_IMMH= 5.U(3.W) // immediate right shifted four 
   val OP2_X   = BitPat("b???")
 
   // Register File Write Enable Signal
@@ -261,6 +262,7 @@ trait ScalarOpConstants
   val uopMTE_ADD   = 110.U(UOPC_SZ.W)
   val uopMTE_ADDTI = 111.U(UOPC_SZ.W)
   val uopMTE_STTI  = 112.U(UOPC_SZ.W)
+  val uopMTE_IRT   = 113.U(UOPC_SZ.W)
 
   // The Bubble Instruction (Machine generated NOP)
   // Insert (XOR x0,x0,x0) which is different from software compiler

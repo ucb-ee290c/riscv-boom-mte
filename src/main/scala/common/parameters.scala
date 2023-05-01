@@ -169,7 +169,7 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     val init = BigInt(
       0 << MTECSRs.smte_config_enableShift |
       0 << MTECSRs.smte_config_enforceSyncShift |
-      0xf << MTECSRs.smte_config_permissiveTagShift
+      0 << MTECSRs.smte_config_permissiveTagShift
     )
     mteCSRGen(MTECSRs.smte_configID, mask, init)
   }

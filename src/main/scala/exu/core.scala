@@ -40,6 +40,8 @@ import freechips.rocketchip.util.{Str, UIntIsOneOf, CoreMonitorBundle}
 import freechips.rocketchip.devices.tilelink.{PLICConsts, CLINTConsts}
 import freechips.rocketchip.tile._
 
+import testchipip.{ExtendedTracedInstruction}
+
 import boom.common._
 import boom.ifu.{GlobalHistory, HasBoomFrontendParameters}
 import boom.exu.FUConstants._
@@ -337,6 +339,15 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       faCSR.wport_wdata := DontCare  
     }
   }
+
+  if (useMTE) {
+    exe_units.alu_units.foreach {
+      alu =>
+        alu.io.dprv := csr.io.status.dprv
+        alu.io.mte_permissive_tag := custom_csrs.mtePermissiveTag
+    }
+  }
+
 
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
   val icache_blocked = false.B

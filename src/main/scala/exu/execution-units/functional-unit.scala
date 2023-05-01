@@ -22,7 +22,7 @@ import chisel3.util._
 import freechips.rocketchip.config.Parameters
 import freechips.rocketchip.util._
 import freechips.rocketchip.tile
-import freechips.rocketchip.rocket.{PipelinedMultiplier,BP,BreakpointUnit,Causes,CSR}
+import freechips.rocketchip.rocket.{PipelinedMultiplier,BP,BreakpointUnit,Causes,CSR,PRV}
 
 import boom.common._
 import boom.ifu._
@@ -179,6 +179,11 @@ abstract class FunctionalUnit(
 
     val bypass = Output(Vec(numBypassStages, Valid(new ExeUnitResp(dataWidth))))
 
+    // only used by ALU in MTE
+    val dprv    = if (isAluUnit) Input(UInt(PRV.SZ.W)) else null
+
+    val mte_permissive_tag = if (isAluUnit) Input(UInt(MTEConfig.tagBits.W)) else null
+
     // only used by the fpu unit
     val fcsr_rm = if (needsFcsr) Input(UInt(tile.FPConstants.RM_SZ.W)) else null
 
@@ -286,21 +291,68 @@ class MTEALUAddOnUnit(dataWidth:Int)(implicit p: Parameters)
       val imm     = Input(UInt(dataWidth.W))
       val out     = Output(UInt(dataWidth.W))
       val valid   = Output(Bool())
+      val dprv    = Input(UInt(PRV.SZ.W))
+      val brupdate = Input(new BrUpdateInfo())
+      val mte_permissive_tag = Input(UInt(MTEConfig.tagBits.W))
   })
+
+  val lfsrs = Wire(Vec(4, UInt(4.W)))
+
+  for (i <- 0 until 4) {
+    val lfsr = random.GaloisLFSR.maxPeriod(
+      width = 16,
+      /* 
+      By isolating LFSRs by prv and advancing them at different hard to predict
+      rates, we're able to make breaking the LFSR difficult. 
+      Isolation helps on time sharing systems since a process can't typically
+      know the exact breakdown of time spent in S and U mode of the target, let
+      alone the number of branches at a given ROB index. Additionally, by adding
+      a dependency on the uopc flying through the pipeline, we both require they
+      know all the instructions which executed on this specific ALU lane.
+      It's still not a CSPRNG but there's likely no practical way to do this.
+      */
+      increment = io.dprv === i.U || (
+        io.brupdate.b1.mispredict_mask(i + 1) ^
+        io.req.bits.uop.uopc(i)
+      ),
+      seed = Some(i + 1)
+    )
+    lfsrs(i) := lfsr
+  }
+
 
   val rs1 = io.req.bits.rs1_data
   val rs2 = io.req.bits.rs2_data
   val uop = io.req.bits.uop
   val uopc = uop.uopc
-  when (uopc === uopMTE_ADD) {
-    io.valid := true.B
-    /* Take the result of the add but preserve the tags from the original Rs1 */
-    io.out := Cat(rs1(63, 60), io.alu_out(59, 0))
-  } 
-  .otherwise {
-    io.valid := false.B
-    io.out := DontCare
+  io.valid := false.B
+  io.out := DontCare
+
+  switch (uopc) {
+    is (uopMTE_ADD) {
+      io.valid := true.B
+      /* Take the result of the add but preserve the tags from the original Rs1 */
+      io.out := Cat(rs1(63, 60), io.alu_out(59, 0))
+    }
+
+    is (uopMTE_IRT) {
+      io.valid := true.B
+
+      /* Insert the tag alongside the add result */
+      val tag = lfsrs(io.dprv)(MTEConfig.tagBits - 1, 0)
+      io.out := Cat(tag, io.alu_out(59, 0))
+    }
+
+    is (uopMTE_ADDTI) {
+      io.valid := true.B
+      /* Step over the permissive tag */
+      val tag0 = rs1(63, 60) + io.imm(3, 0)
+      val tag1 = rs1(63, 60) + io.imm(3, 0) + 1.U(4.W)
+      val tag = Mux(tag0 === io.mte_permissive_tag, tag1, tag0)
+      io.out := Cat(tag, io.alu_out(59, 0))
+    }
   }
+
 }
 
 /**
@@ -341,11 +393,13 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
   }
 
   // operand 2 select
+  val imm_xprlen_u = imm_xprlen.asUInt
   val op2_data = Mux(uop.ctrl.op2_sel === OP2_IMM,  Sext(imm_xprlen.asUInt, xLen),
                  Mux(uop.ctrl.op2_sel === OP2_IMMC, io.req.bits.uop.prs1(4,0),
                  Mux(uop.ctrl.op2_sel === OP2_RS2 , io.req.bits.rs2_data,
                  Mux(uop.ctrl.op2_sel === OP2_NEXT, Mux(uop.is_rvc, 2.U, 4.U),
-                                                    0.U))))
+                 Mux(uop.ctrl.op2_sel === OP2_IMMH, Sext(imm_xprlen_u(imm_xprlen_u.getWidth - 1, 4), xLen),
+                                                    0.U)))))
 
   val alu = Module(new freechips.rocketchip.rocket.ALU())
 
@@ -362,6 +416,9 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
     mteAddOn.io.req     := io.req
     mteAddOn.io.alu_out := alu.io.out
     mteAddOn.io.imm := imm_xprlen.asUInt
+    mteAddOn.io.brupdate := io.brupdate
+    mteAddOn.io.dprv := io.dprv
+    mteAddOn.io.mte_permissive_tag := io.mte_permissive_tag
   }
 
 
@@ -528,8 +585,11 @@ class MemAddrCalcUnit(implicit p: Parameters)
   val addr_imm_offset = Wire(SInt(LONGEST_IMM_SZ.W))
   if (useMTE) {
     when (io.req.bits.uop.uopc === uopMTE_STTI) {
-      // Use the lower 8 bits as an address offset
-      addr_imm_offset := io.req.bits.uop.imm_packed(15, 8).asSInt
+      // Use the upper 8 bits as an address offset
+      addr_imm_offset := Cat(
+        io.req.bits.uop.imm_packed(19, 12), 
+        0.U(4.W)
+      ).asSInt
     } .otherwise {
       addr_imm_offset := io.req.bits.uop.imm_packed(19, 8).asSInt
     }
@@ -558,8 +618,8 @@ class MemAddrCalcUnit(implicit p: Parameters)
     io.resp.bits.mte_tag.get := addr_tag
 
     when (io.req.bits.uop.uopc === uopMTE_STTI) {
-      /* Use the upper four bits of the immediate to advance the write tag argument */
-      val new_tag = addr_tag + io.req.bits.uop.imm_packed(19, 16)
+      /* Use the lower four bits of the immediate to advance the write tag argument */
+      val new_tag = addr_tag + io.req.bits.uop.imm_packed(11, 8)
       store_data := Cat(Fill(dataWidth - MTEConfig.tagBits, 0.U), new_tag)
     } .otherwise {
       store_data := io.req.bits.rs2_data
@@ -591,7 +651,8 @@ class MemAddrCalcUnit(implicit p: Parameters)
   val misaligned =
     (size === 1.U && (effective_address(0) =/= 0.U)) ||
     (size === 2.U && (effective_address(1,0) =/= 0.U)) ||
-    (size === 3.U && (effective_address(2,0) =/= 0.U))
+    (size === 3.U && (effective_address(2,0) =/= 0.U)) ||
+    (io.req.bits.uop.is_mte_tag_write && (effective_address(3,0) =/= 0.U))
 
   val bkptu = Module(new BreakpointUnit(nBreakpoints))
   bkptu.io.status   := io.status
