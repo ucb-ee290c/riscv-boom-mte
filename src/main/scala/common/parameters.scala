@@ -180,9 +180,6 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   def smte_fstatusCSR : Option[CustomCSR] = 
     mteCSRGen(MTECSRs.smte_fstatusID, xLenMask, 0, true)
 
-  def smte_tagSeedCSR : Option[CustomCSR] = 
-    mteCSRGen(MTECSRs.smte_tag_seedID, xLenMask, 0)
-
   def smte_tagbaseCSRs : Seq[CustomCSR] = MTECSRs.smte_tagbaseIDs(mteRegions).flatMap {
     csr_id =>
     mteCSRGen(csr_id, physicalAddressMask, 0)
@@ -193,8 +190,13 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     mteCSRGen(csr_id, physicalAddressMask, 0)
   }
 
+  def smte_dbg_tcache_reqCSR = mteCSRGen(MTECSRs.smte_dbg_tcache_req, xLenMask, 0, true)
+  def smte_dbg_tcache_data0CSR = mteCSRGen(MTECSRs.smte_dbg_tcache_data0, xLenMask, 0, true)
+  def smte_dbg_tcache_data1CSR = mteCSRGen(MTECSRs.smte_dbg_tcache_data1, xLenMask, 0, true)
+
   override def decls = super.decls ++ smte_configCSR ++ smte_faCSR ++ 
-    smte_fstatusCSR ++ smte_tagSeedCSR ++ smte_tagbaseCSRs ++ smte_tagmaskCSRs
+    smte_fstatusCSR ++ smte_tagbaseCSRs ++ smte_tagmaskCSRs ++
+    smte_dbg_tcache_reqCSR ++ smte_dbg_tcache_data0CSR ++ smte_dbg_tcache_data1CSR
 
   def disableOOO = getOrElse(chickenCSR, _.value(3), true.B)
 

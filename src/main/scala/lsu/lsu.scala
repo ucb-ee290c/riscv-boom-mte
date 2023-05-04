@@ -170,6 +170,7 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
     val tlbMiss = Bool()
   })
 
+  val mte_enabled = useMTE.option(Input(Bool()))
   val mte_permissive_tag = useMTE.option(Input(UInt(MTEConfig.tagBits.W)))
   val mte_fault_packet = useMTE.option(Output(Valid(new MTEFaultPacket)))
 }
@@ -945,7 +946,7 @@ val ldq_head_e_mte_phys_mte_tag_pending = ldq_head_e.bits.phys_mte_tag_pending.g
     when (mem_xcpt_valids(w))
     {
       assert(RegNext(will_fire_load_incoming(w) || will_fire_stad_incoming(w) || will_fire_sta_incoming(w) ||
-        will_fire_load_retry(w) || will_fire_sta_retry(w)))
+        will_fire_load_retry(w) || will_fire_sta_retry(w) || will_fire_stta_incoming(w) || will_fire_stta_retry(w)))
       // Technically only faulting AMOs need this
       assert(mem_xcpt_uops(w).uses_ldq ^ mem_xcpt_uops(w).uses_stq)
       when (mem_xcpt_uops(w).uses_ldq)
@@ -1054,6 +1055,7 @@ val ldq_head_e_mte_phys_mte_tag_pending = ldq_head_e.bits.phys_mte_tag_pending.g
   if (useMTE) {
     require(memWidth == 1, "Tag cache does not support width > 1")
     val tcacheIO = io.tcache.get
+    val mteEnabled = io.core.mte_enabled.get
     for (w <- 0 until memWidth) {
       val req = tcacheIO.req
       val reqB = req.bits
@@ -1113,7 +1115,9 @@ val ldq_head_e_mte_phys_mte_tag_pending = ldq_head_e.bits.phys_mte_tag_pending.g
           commit operation. We can end up in this situation if, say, dmem nacks
           and we rewind but tcache continues okay.
           */
-          (!tcache_uop(w).is_mte_tag_write || !(tcache_stq_e(w).bits.commit_in_flight || tcache_stq_e(w).bits.succeeded))
+          (!tcache_uop(w).is_mte_tag_write || !(tcache_stq_e(w).bits.commit_in_flight || tcache_stq_e(w).bits.succeeded)) &&
+          /* Do not interact with TCache if MTE is disabled */
+          mteEnabled
 
         reqB.uop := tcache_uop(w)
         reqB.uop.br_mask := GetNewBrMask(io.core.brupdate, tcache_uop(w).br_mask)
@@ -1127,7 +1131,14 @@ val ldq_head_e_mte_phys_mte_tag_pending = ldq_head_e.bits.phys_mte_tag_pending.g
           assert(!e.bits.phys_mte_tag_pending.get, "Already executed?")
           assert(!e.bits.phys_mte_tag.get.valid, "Trying to fire when tags already valid")
 	        printf("[lsu] LDQ %d, tcache_can_fire=%d, addr=%x [tsc=%d]\n", tcache_uop(w).ldq_idx, can_fire, reqB.address, io.core.tsc_reg)
-          e.bits.phys_mte_tag_pending.get := can_fire
+          when (mteEnabled) {
+            e.bits.phys_mte_tag_pending.get := can_fire
+          } .otherwise {
+            /* If MTE is not enabled, just fake the tags */
+            e.bits.phys_mte_tag_pending.get := false.B
+            e.bits.phys_mte_tag.get.valid := true.B
+            e.bits.phys_mte_tag.get.bits := io.core.mte_permissive_tag.get
+          }
 	        ldq_dump()
         } .elsewhen(tcache_stq_e(w).valid) {
 	        val e = stq(tcache_uop(w).stq_idx)
@@ -1140,17 +1151,34 @@ val ldq_head_e_mte_phys_mte_tag_pending = ldq_head_e.bits.phys_mte_tag_pending.g
             when (can_fire) {
               e.bits.commit_in_flight := true.B
             }
-            when (can_fire || already_launched) {
+            when (can_fire || already_launched || !mteEnabled) {
               /*
               Speculatively advance the execute head if we fired or just step
-              over if we've already executed
+              over if we've already executed.
+              We also fake fire tag writes (i.e. nop them) when they are executed
+              with MTE disabled
               */
               stq_execute_head := WrapInc(stq_execute_head, numStqEntries)
+            }
+
+            when (!mteEnabled) {
+              /* 
+              If we're fake launching the tag write, we need to complete it too
+              since we won't get a response from the cache
+              */
+              e.bits.succeeded := true.B
             }
           } .otherwise {
             assert(!e.bits.phys_mte_tag_pending.get, "Already executed?")
             assert(!e.bits.phys_mte_tag.get.valid, "Trying to fire when tags already valid")
-            e.bits.phys_mte_tag_pending.get := can_fire
+            when (mteEnabled) {
+              e.bits.phys_mte_tag_pending.get := can_fire
+            } .otherwise {
+              /* If MTE is not enabled, just fake the tags */
+              e.bits.phys_mte_tag_pending.get := false.B
+              e.bits.phys_mte_tag.get.valid := true.B
+              e.bits.phys_mte_tag.get.bits := io.core.mte_permissive_tag.get
+            }
           }
 
 	        stq_dump()
@@ -1166,6 +1194,7 @@ val ldq_head_e_mte_phys_mte_tag_pending = ldq_head_e.bits.phys_mte_tag_pending.g
     val resp = tcacheIO.resp
     val respB = tcacheIO.resp.bits
     when (resp.valid) {
+      assert(io.core.mte_enabled.get, "TCache should not respond when MTE is disabled")
 	    
       when (respB.uop.uses_ldq) {
         printf("[lsu] tcache response arrived LDQ %d, addr=%x, nack=%d, tag=%x [tsc=%d]\n", respB.uop.ldq_idx, ldq(respB.uop.ldq_idx).bits.addr.bits, respB.nack,respB.data, io.core.tsc_reg)

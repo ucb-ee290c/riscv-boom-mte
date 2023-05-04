@@ -578,7 +578,7 @@ class WithBoomSmallBPD extends Config((site, here, up) => {
   }
 })
 
-class WithBoomMTE(mteRegions:List[BoomMTERegion], nSets:Int = 8, nWays:Int = 2, nMSHRs:Int = 4) extends Config((site, here, up) => {
+class WithBoomMTE(mteRegions:List[BoomMTERegion], nSets:Int = 8, nWays:Int = 4, nMSHRs:Int = 4) extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
     case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(
       core = tp.tileParams.core.copy(

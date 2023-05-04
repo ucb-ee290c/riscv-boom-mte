@@ -344,7 +344,6 @@ class MTEALUAddOnUnit(dataWidth:Int)(implicit p: Parameters)
     }
 
     is (uopMTE_ADDTI) {
-      printf("[alu] uopMTE_ADDTI pc=%x\n", uop.debug_pc)
       io.valid := true.B
       /* Step over the permissive tag */
       val tag0 = rs1(63, 60) + io.imm(3, 0)
@@ -665,7 +664,7 @@ class MemAddrCalcUnit(implicit p: Parameters)
   bkptu.io.scontext := io.scontext
 
   val ma_ld  = io.req.valid && io.req.bits.uop.uopc === uopLD && misaligned
-  val ma_st  = io.req.valid && (io.req.bits.uop.uopc === uopSTA || io.req.bits.uop.uopc === uopAMO_AG) && misaligned
+  val ma_st  = io.req.valid && (io.req.bits.uop.uopc === uopSTA || io.req.bits.uop.uopc === uopAMO_AG || io.req.bits.uop.is_mte_tag_write) && misaligned
   val dbg_bp = io.req.valid && ((io.req.bits.uop.uopc === uopLD  && bkptu.io.debug_ld) ||
                                 (io.req.bits.uop.uopc === uopSTA && bkptu.io.debug_st))
   val bp     = io.req.valid && ((io.req.bits.uop.uopc === uopLD  && bkptu.io.xcpt_ld) ||

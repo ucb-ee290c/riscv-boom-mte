@@ -1,4 +1,5 @@
 package boom.common
+import chisel3._
 import chisel3.util._
 import freechips.rocketchip.tile.CustomCSR
 
@@ -29,20 +30,7 @@ object MTEInstructions {
     /* I-types */
     /* mte.addti is funct3 = 3'b110 */
     def MTE_ADDTI          = BitPat("b????????????_?????_110_?????_1111011")
-
-//   def CUSTOM3            = BitPat("b?????????????????000?????1111011")
-//   def CUSTOM3_RS1        = BitPat("b?????????????????010?????1111011")
-//   def CUSTOM3_RS1_RS2    = BitPat("b?????????????????011?????1111011")
-//   def CUSTOM3_RD         = BitPat("b?????????????????100?????1111011")
-//   def CUSTOM3_RD_RS1     = BitPat("b?????????????????110?????1111011")
-//   def CUSTOM3_RD_RS1_RS2 = BitPat("b?????????????????111?????1111011")
 }
-
-// class MMTEConfigCSR(implicit p: Parameters) extends BoomBundle {
-//     val enable          = UInt(3.W)
-//     val enforce_sync    = UInt(3.W)
-//     val permissive_tag  = UInt(4.W)
-// }
 
 object MTECSRs {
 
@@ -53,10 +41,10 @@ object MTECSRs {
     val smte_configID   = 0x5c0
     val smte_fstatusID  = 0x5c1
     val smte_faID       = 0x5c2
-    val smte_tag_seedID = 0x5c3
 
-    private val smte_tag_base_min_id = 0x5c4
+    private val smte_tag_base_min_id = 0x5c3
     private val mte_region_max = 5
+    private val smte_tag_base_max_id = smte_tag_base_min_id + mte_region_max * 2 - 1
 
     def smte_tagbaseIDs(mteRegions:List[BoomMTERegion]):Seq[Int] = {
         val regionCount = mteRegions.size
@@ -76,6 +64,12 @@ object MTECSRs {
             smte_tag_base_min_id + (2 * i) + 1
         }
     }
+
+    def smte_dbg_tcache_req   = 0x5cd
+    def smte_dbg_tcache_data0 = 0x5ce 
+    def smte_dbg_tcache_data1 = 0x5cf
+    
+    assert(smte_dbg_tcache_req == smte_tag_base_max_id + 1)
 
     def widthToMask(width:Int):BigInt = {
         (BigInt(1) << width) - 1

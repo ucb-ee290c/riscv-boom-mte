@@ -279,6 +279,16 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
     val fstatusCSR = custom_csrs.getWritableOpt(custom_csrs.smte_fstatusCSR).get
 
+    val dbg_tcache_req = custom_csrs.getWritableOpt(custom_csrs.smte_dbg_tcache_reqCSR).get
+    val dbg_tcache_data0 = custom_csrs.getWritableOpt(custom_csrs.smte_dbg_tcache_data0CSR).get
+    val dbg_tcache_data1 = custom_csrs.getWritableOpt(custom_csrs.smte_dbg_tcache_data1CSR).get
+
+    val fault_pkt = io.lsu.mte_fault_packet.get
+    val prv = csr.io.status.prv
+    val dprv = csr.io.status.dprv
+    val mte_enabled_prv = custom_csrs.mteEnabled(dprv)
+    val mteFStatusValid = custom_csrs.mteFStatusValid
+
     /* Pass the region configuration */
     
     io.tcache.mteRegionBases := VecInit(custom_csrs.smte_tagbases)
@@ -286,14 +296,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     io.tcache.mtePermissiveTag := custom_csrs.mtePermissiveTag
     io.tcache.brupdate := brupdate
     io.tcache.exception := RegNext(rob.io.flush.valid) /* mirrors LSU */
+    io.tcache.dbg_tcache_req <> dbg_tcache_req
+    io.tcache.dbg_tcache_data0 <> dbg_tcache_data0
+    io.tcache.dbg_tcache_data1 <> dbg_tcache_data1
 
     io.lsu.mte_permissive_tag.get := custom_csrs.mtePermissiveTag
-
-    val fault_pkt = io.lsu.mte_fault_packet.get
-    val prv = csr.io.status.prv
-    val dprv = csr.io.status.dprv
-    val mte_enabled_prv = custom_csrs.mteEnabled(dprv)
-    val mteFStatusValid = custom_csrs.mteFStatusValid
+    io.lsu.mte_enabled.get := mte_enabled_prv
     dontTouch(prv)
     dontTouch(dprv)
     dontTouch(mteFStatusValid)

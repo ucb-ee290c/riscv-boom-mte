@@ -11,7 +11,7 @@ import boom.exu.{BrUpdateInfo}
 import boom.util.{IsKilledByBranch, GetNewBrMask, UpdateBrMask}
 import freechips.rocketchip.util.DescribedSRAM
 import chisel3.experimental.ChiselEnum
-import freechips.rocketchip.tile.HasCoreParameters
+import freechips.rocketchip.tile.{HasCoreParameters, CustomCSRIOWritable}
 import freechips.rocketchip.rocket.PRV
 import freechips.rocketchip.util.RandomReplacement
 import freechips.rocketchip.util.UIntToOH1
@@ -270,16 +270,20 @@ class TCacheOperation(implicit p: Parameters, tcacheParams: TCacheParams)
     val data = UInt(width = (tcacheParams.blockSizeBytes * 8).W)
 }
 
-// class TCacheNLCRequest(implicit p: Parameters, tcacheParams: TCacheParams) 
-//     extends TCacheBundle()(p, tcacheParams) with HasBoomUOP {
-//     val address = new TagStoragePhysicalAddress()(p, tcacheParams)
-//     val tag_write = Valid(UInt(width = MTEConfig.tagBits.W))
-// }
+object TCacheDebugRequestType extends ChiselEnum {
+    /* 0.U is unused; an all zero req register is how we signal ready */
+    /* Reads a raw set and way into the data CSRs */
+    val RAW_READ   = Value(1.U)
+    /* Writes the raw data from the data CSRs into a given set and way */
+    val RAW_WRITE  = Value(2.U)
+    /* Starts adataArrays multi-cycle clean and invalidate operation */
+    val FLUSH = Value(3.U)
+}
 
-// class TCacheNLCResponse(implicit p: Parameters, tcacheParams: TCacheParams) 
-//     extends TCacheBundle()(p, tcacheParams) with HasBoomUOP {
-    
-// }
+object TCacheDebugRequest {
+    val opShift = 0
+    val opWidth = 2
+}
 
 class TCacheLSUIO(implicit p: Parameters, tcacheParams: TCacheParams) 
     extends TCacheBundle()(p, tcacheParams) {
@@ -315,6 +319,9 @@ class TCacheCoreIO(implicit p: Parameters) extends BoomBundle()(p) {
     val brupdate = Input(new BrUpdateInfo)
     val exception = Input(Bool())
     val tsc_reg     = Input(UInt())
+    val dbg_tcache_req = Flipped(new CustomCSRIOWritable)
+    val dbg_tcache_data0 = Flipped(new CustomCSRIOWritable)
+    val dbg_tcache_data1 = Flipped(new CustomCSRIOWritable)
 }
 
 class TCacheIO(implicit p: Parameters, tcacheParams: TCacheParams) 
@@ -347,6 +354,10 @@ class BoomNonBlockingTCacheModule(
     val por_meta_i = RegInit(0.U(log2Ceil(tcacheParams.nSets).W))
     dontTouch(is_running_por)
     dontTouch(por_meta_i)
+
+    /* Are the SRAMs being exclusively accessed by a unique debug operation? */
+    val dbg_array_access_override = Wire(Bool())
+    dbg_array_access_override := false.B
 
     /*
     ~* Miss Status Handler Registers *~
@@ -399,7 +410,7 @@ class BoomNonBlockingTCacheModule(
     MSHR to handle a miss.
     */
     val s0_is_executing_replay = Wire(Bool())
-    io.lsu.req.ready := !s0_is_executing_replay && !is_running_por
+    io.lsu.req.ready := !s0_is_executing_replay && !is_running_por && !dbg_array_access_override
 
     when (io.lsu.req.fire) {
         printf("[tcache] accepted request for addr=0x%x, op=%d [tsc=%d]\n", io.lsu.req.bits.address, io.lsu.req.bits.requestType.asUInt, io.core.tsc_reg)
@@ -446,8 +457,17 @@ class BoomNonBlockingTCacheModule(
         * If write, launch masked data write
         * If replay, launch unmasked data write
 
-        TODO: Forward data writes backwards in-case the address in S1 is the same
-        as we're writing here
+
+    Debug operations:
+        Since raw RAM operations are fired via a CSR, we know that at least for
+        the cycle that the register is writing that the entire pipeline is
+        drained. This lets us directly use the SRAMs read/write ports without
+        needing to go down the pipeline.
+
+        Clean and invalidate is a bit special. Once activated, it locks out the
+        cache (drives ready low) and then progressively writes back any dirty
+        ways. Since, again, we have exclusive control over the cache, we are
+        able to seize control of the array
     */
     val dataArraysEntries = tcacheParams.nSets * tcacheParams.nWays
     val dataArrays = DescribedSRAM(
@@ -458,6 +478,17 @@ class BoomNonBlockingTCacheModule(
         data = Vec(mteTagsPerBlock, Bits(MTEConfig.tagBits.W))
     )
 
+    val dbg_dataArrays_ren = Wire(Bool())
+    val dbg_dataArrays_ridx = Wire(UInt(log2Ceil(dataArraysEntries).W))
+    val dbg_dataArrays_widx = Wire(UInt(log2Ceil(dataArraysEntries).W))
+    val dbg_dataArrays_wmask = Wire(Vec(mteTagsPerBlock, Bool()))
+    val dbg_dataArrays_wdata = Wire(dataArrays.t)
+    dbg_dataArrays_ren := false.B
+    dbg_dataArrays_ridx := DontCare
+    dbg_dataArrays_widx := DontCare
+    dbg_dataArrays_wmask := VecInit(Seq.fill(mteTagsPerBlock)(false.B))
+    dbg_dataArrays_wdata := DontCare
+
     val metaT = new TCacheMetaEntry()(p, tcacheParams)
     val metaWidth = metaT.getWidth
     val metaArrays = DescribedSRAM(
@@ -466,6 +497,17 @@ class BoomNonBlockingTCacheModule(
         size = tcacheParams.nSets,
         data = Vec(tcacheParams.nWays, Bits(metaWidth.W))
     )
+
+    val dbg_metaArrays_ren = Wire(Bool())
+    val dbg_metaArrays_ridx = Wire(UInt(log2Ceil(tcacheParams.nSets).W))
+    val dbg_metaArrays_widx = Wire(UInt(log2Ceil(tcacheParams.nSets).W))
+    val dbg_metaArrays_wmask = Wire(Vec(tcacheParams.nWays, Bool()))
+    val dbg_metaArrays_wdata = Wire(Vec(tcacheParams.nWays, metaT))
+    dbg_metaArrays_ren := false.B
+    dbg_metaArrays_ridx := DontCare
+    dbg_metaArrays_widx := DontCare
+    dbg_metaArrays_wmask := VecInit(Seq.fill(tcacheParams.nWays)(false.B))
+    dbg_metaArrays_wdata := DontCare
 
     def op_is_write_killed(op:TCacheOperation):Bool = {
         /* If S2 is nacking a write, all younger writes need to be killed */
@@ -592,10 +634,21 @@ class BoomNonBlockingTCacheModule(
     val s1_s2_way_index = Wire(UInt(log2Ceil(tcacheParams.nWays).W))
     val s1_s2_is_writing_data = Wire(Bool())
 
+    val metaArrays_ren = Wire(Bool())
+    val metaArrays_ridx = Wire(UInt(log2Ceil(tcacheParams.nSets).W))
+    when (dbg_array_access_override) {
+        metaArrays_ren := dbg_metaArrays_ren
+        metaArrays_ridx := dbg_metaArrays_ridx
+    } .otherwise {
+        metaArrays_ren := s0_op_valid && s0_op.address.valid
+        metaArrays_ridx := s0_op.address.bits.addressIndex
+    }
+
+
     /* We always need to access meta but don't always care to read data */
     s1_sram_meta_read_value := metaArrays.read(
-        s0_op.address.bits.addressIndex, 
-        s0_op_valid && s0_op.address.valid
+        metaArrays_ridx, 
+        metaArrays_ren
     ).map{ _.asTypeOf(metaT) }
     val s1_meta_read_value = Mux(s1_is_meta_forwarding, s1_meta_forwarding_value, s1_sram_meta_read_value)
 
@@ -640,44 +693,9 @@ class BoomNonBlockingTCacheModule(
                         (s1_op.requestType === TCacheRequestTypeEnum.READ || 
                          s1_op.requestType === TCacheRequestTypeEnum.WRITE) 
     
-    // /*
-    // Since the read result of simultaneously writing and reading the same address
-    // on an array is undefined, we nack any operations which will have either
-    // generated a hazard. The only op that could pose a hazard to us is the one
-    // currently in S2 because when we were in S0 it was writing meta in S1 (hazard)
-    // and now that we're in S1 it is writing the data we want to read in S2.
-    // */
-    // val s1_hazard_blocked = Wire(Bool())
-
-    // /* We only have a hazard if they targeted the same record as us */
-    // val s1_idx_matches_s2 = s1_s2_op.address.bits.addressIndex === s1_op.address.bits.addressIndex
-    // when (!s1_s2_op_valid) {
-    //     /* Trivially hazard free -- nothing should be happening here */
-    //     s1_hazard_blocked := false.B
-    // } .elsewhen (s1_s2_op.requestType === TCacheRequestTypeEnum.WRITE) {
-    //     /*
-    //     TODO: We might actually be able to get craftier and allow back to back
-    //     writes so long as we're sure metadata won't be corrupted.
-    //     */
-    //     /* The hazard only exists if the write actually happened */
-    //     s1_hazard_blocked := !s1_s2_nack && s1_idx_matches_s2
-    // } .elsewhen (TCacheRequestTypeEnum.is_replay(s1_s2_op.requestType)) {
-    //     /* 
-    //     If the previous operation was a replay, our entire metadata is undefined
-    //     and so there's not much we can do.
-    //     */ 
-    //     s1_hazard_blocked := s1_idx_matches_s2
-    // } .otherwise {
-    //     /* 
-    //     All other request types either don't flow down this pipeline or do not
-    //     write
-    //     */
-    //     s1_hazard_blocked := false.B
-    // }
     val s1_nack = 
         (s1_needs_miss && !available_mshr.req_op.ready) || 
         s1_mshr_blocked 
-        // || s1_hazard_blocked
     
     // The index to read to get the data for the hit way
     val s1_hit_data_array_idx = 
@@ -715,6 +733,11 @@ class BoomNonBlockingTCacheModule(
         } .otherwise {
             is_running_por := false.B
         }
+    } .elsewhen (dbg_array_access_override) {
+        s1_meta_waddr := dbg_metaArrays_widx
+        s1_meta_wmask := dbg_metaArrays_wmask
+        s1_meta_wdata := dbg_metaArrays_wdata
+        s1_is_writing_metadata := true.B
     } .elsewhen (s1_op_valid && !s1_nack &&
           s1_op.requestType === TCacheRequestTypeEnum.WRITE && s1_hit) {
         /* Write hit. We simply need to mark the line as dirty */
@@ -802,20 +825,23 @@ class BoomNonBlockingTCacheModule(
 
     s1_data_array_enable := false.B
     s1_data_array_idx := DontCare
-    when (s1_op_valid) {
-        when (s1_replay_needs_writeback) {
-            s1_data_array_enable := !s1_is_data_forwarding
-            s1_data_array_idx := s1_replay_writeback_data_array_idx
-        } .elsewhen((s1_op.requestType === TCacheRequestTypeEnum.READ ||
-                        s1_op.requestType === TCacheRequestTypeEnum.WRITE) &&
-                    s1_op.address.valid && s1_hit) {
-            s1_data_array_enable := !s1_is_data_forwarding
-            s1_data_array_idx := s1_hit_data_array_idx
-        } 
+    when (dbg_array_access_override) {
+        s1_data_array_enable := dbg_dataArrays_ren
+        s1_data_array_idx := dbg_dataArrays_ridx
+    }.otherwise {
+        when (s1_op_valid) {
+            when (s1_replay_needs_writeback) {
+                s1_data_array_enable := !s1_is_data_forwarding
+                s1_data_array_idx := s1_replay_writeback_data_array_idx
+            } .elsewhen((s1_op.requestType === TCacheRequestTypeEnum.READ ||
+                            s1_op.requestType === TCacheRequestTypeEnum.WRITE) &&
+                        s1_op.address.valid && s1_hit) {
+                s1_data_array_enable := !s1_is_data_forwarding
+                s1_data_array_idx := s1_hit_data_array_idx
+            } 
+        }
     }
     
-
-
     /* Handle MSHR dispatch */
     when (s1_replay_needs_writeback) {
         /*
@@ -1013,7 +1039,7 @@ class BoomNonBlockingTCacheModule(
     // we are always going to be writing to that way (replay)
     assert(!s2_victim_way_idx.valid || s2_victim_way_idx.valid && TCacheRequestTypeEnum.is_replay(s2_op_type), "Victim for non-replay?")
     val s2_data_wway_idx = Mux(s2_victim_way_idx.valid, s2_victim_way_idx.bits, s2_way_hit_idx)
-    val s2_data_widx = Cat(s2_op.address.bits.addressIndex, s2_data_wway_idx)
+    val s2_data_widx = Wire(UInt(log2Ceil(dataArraysEntries).W))
     val s2_data_wmask = Wire(Vec(mteTagsPerBlock, Bool()))
     val s2_data_wdata = Wire(dataArrays.t)
     val s2_is_writing_data = Wire(Bool())
@@ -1021,7 +1047,14 @@ class BoomNonBlockingTCacheModule(
     // Reshape the request to be a vector like the array
     val s2_op_data = Wire(Vec(mteTagsPerBlock, UInt(MTEConfig.tagBits.W)))
     s2_op_data := s2_op.data.asTypeOf(s2_op_data)
-    when((s2_op_valid || s2_s1_wrote_metadata) &&
+    s2_data_widx := Cat(s2_op.address.bits.addressIndex, s2_data_wway_idx)
+    when (dbg_array_access_override) {
+        s2_data_widx := dbg_dataArrays_widx
+        s2_data_wmask := dbg_dataArrays_wmask
+        s2_data_wdata := dbg_dataArrays_wdata
+        
+        s2_is_writing_data := true.B
+    } .elsewhen((s2_op_valid || s2_s1_wrote_metadata) &&
                s2_op_type === TCacheRequestTypeEnum.WRITE && s2_hit) {
         /* Mask the write so we only hit the appropriate tag */
         val offset = Cat(s2_op.address.bits.address(s2_op.cacheOffsetBits, 0), 
@@ -1063,6 +1096,231 @@ class BoomNonBlockingTCacheModule(
     s1_s2_op_valid := s2_op_valid
     s1_s2_way_index := s2_data_wway_idx
     s1_s2_is_writing_data := s2_is_writing_data
+
+    /* 
+    ~* Debug operation handler *~ 
+    */
+
+    /* Tie off write ports by default, we'll write if we need to */
+    io.core.dbg_tcache_req.wport_wen := false.B
+    io.core.dbg_tcache_req.wport_wdata := DontCare
+    io.core.dbg_tcache_data0.wport_wen := false.B
+    io.core.dbg_tcache_data0.wport_wdata := DontCare
+    io.core.dbg_tcache_data1.wport_wen := false.B
+    io.core.dbg_tcache_data1.wport_wdata := DontCare
+
+    val dbg_req = RegInit({
+        val v = Wire(Valid(TCacheDebugRequestType()))
+        v.valid := false.B
+        v.bits := DontCare
+        v
+    })
+
+    val dbg_set_i = Reg(UInt(log2Ceil(tcacheParams.nSets).W))
+    val dbg_way_i = Reg(UInt(log2Ceil(tcacheParams.nWays).W))
+
+    val dbg_set_request_done = WireInit(false.B)
+    when (io.core.dbg_tcache_req.wen && 
+        /* 
+        Do not allow multiple operations to be launched concurrently. This is a
+        software error.
+        */
+        !dbg_req.valid) {
+
+        val req_raw = io.core.dbg_tcache_req.wdata
+        val req_raw_op = req_raw(TCacheDebugRequest.opShift + TCacheDebugRequest.opWidth - 1, TCacheDebugRequest.opShift)
+        val (req_type, req_valid) = TCacheDebugRequestType.safe(req_raw_op)
+        dbg_req.bits := req_type
+
+        val req_raw_setShift = TCacheDebugRequest.opShift + TCacheDebugRequest.opWidth
+        val req_raw_setWidth = log2Ceil(tcacheParams.nSets)
+        val req_raw_wayShift = req_raw_setShift + req_raw_setWidth
+        val req_raw_wayWidth = log2Ceil(tcacheParams.nWays)
+
+        val req_set = req_raw(req_raw_setShift + req_raw_setWidth - 1, req_raw_setShift)
+        val req_way = req_raw(req_raw_wayShift + req_raw_wayWidth - 1, req_raw_wayShift)
+        dbg_set_i := req_set
+        dbg_way_i := req_way
+
+        /* Kick off the operation */
+        when (req_valid) {
+            switch (req_type) {
+                is (TCacheDebugRequestType.RAW_READ) {
+                    /* This is a multi-cycle op so bubble it out */
+                    dbg_req.valid := true.B
+
+                    dbg_array_access_override := true.B
+                    
+                    dbg_dataArrays_ren := true.B
+                    dbg_dataArrays_ridx := Cat(req_set, req_way)
+
+                    dbg_metaArrays_ren := true.B
+                    dbg_metaArrays_ridx := req_set
+                }
+
+                is (TCacheDebugRequestType.RAW_WRITE) {
+                    /* Writes complete in a single cycle, so clear now */
+                    dbg_req.valid := false.B
+                    dbg_set_request_done := true.B
+
+                    dbg_array_access_override := true.B
+
+                    dbg_dataArrays_widx := Cat(req_set, req_way)
+                    dbg_dataArrays_wdata := io.core.dbg_tcache_data0.value.asTypeOf(dbg_dataArrays_wdata)
+                    dbg_dataArrays_wmask :=  VecInit(Seq.fill(mteTagsPerBlock)(true.B))
+
+                    dbg_metaArrays_widx := req_set
+                    dbg_metaArrays_wdata := VecInit(Seq.fill(tcacheParams.nWays)({
+                        val meta_raw = io.core.dbg_tcache_data1.value
+                        val meta = Wire(metaT)
+                        meta.cacheTag.valid := meta_raw(0)
+                        meta.dirty := meta_raw(1)
+                        meta.cacheTag.bits := meta_raw(meta.cacheTag.bits.getWidth + 2 - 1, 2)
+
+                        meta
+                    }))
+                    dbg_metaArrays_wmask := UIntToOH(
+                        req_way, 
+                        tcacheParams.nWays
+                    ).asBools
+                }
+
+                is (TCacheDebugRequestType.FLUSH) {
+                    /*
+                    Flushes are multi-cycle operation. We kick start by 
+                    launching the read for (0, 0).
+                    */
+                    dbg_req.valid := true.B
+                    dbg_set_i := 0.U
+                    dbg_way_i := 0.U
+
+                    dbg_array_access_override := true.B
+                    
+                    dbg_metaArrays_ren := true.B
+                    dbg_metaArrays_ridx := 0.U
+
+                }
+            }
+        }
+    }
+
+    when (dbg_req.valid) {
+        switch (dbg_req.bits) {
+            is (TCacheDebugRequestType.RAW_READ) {
+                /* Send response */
+                io.core.dbg_tcache_data0.wport_wen := true.B
+                io.core.dbg_tcache_data0.wport_wdata := s2_sram_data_read_value.asUInt
+                io.core.dbg_tcache_data1.wport_wen := true.B
+                val meta_e = s1_sram_meta_read_value(dbg_way_i)
+                io.core.dbg_tcache_data1.wport_wdata := Cat(
+                    meta_e.cacheTag.bits,
+                    meta_e.dirty,
+                    meta_e.cacheTag.valid
+                )
+
+                dbg_set_request_done := true.B
+            }
+
+            is (TCacheDebugRequestType.RAW_WRITE) {
+                /* Writes should complete in the first cycle */
+                assert(false.B, "unexpected multi-cycle RAW WRITE")
+            }
+
+            is (TCacheDebugRequestType.FLUSH) {
+                dbg_array_access_override := true.B
+                /*
+                In the previous cycle, we read dbg_set_i, dbg_way_i
+                */
+
+                val meta_e = s1_sram_meta_read_value(dbg_way_i)
+                val needs_writeback = meta_e.cacheTag.valid && meta_e.dirty
+                val can_writeback = available_mshr.req_op.ready
+                /* If all our MSHRs are busy, hang and retry next cycle */
+                val should_advance = !needs_writeback || can_writeback
+
+                /* Launch writeback */
+                when (needs_writeback && can_writeback) {
+                    printf("[tcache] flush writeback set=%x, way=%x\n", dbg_set_i, dbg_way_i)
+                    val req_b = available_mshr.req_op.bits
+                    available_mshr.req_op.valid := true.B
+                    req_b.requestType := TCacheRequestTypeEnum.WRITEBACK
+                    req_b.uop := NullMicroOp
+                    req_b.address.valid := true.B
+                    req_b.address.bits.address := Cat(
+                        meta_e.cacheTag.bits,
+                        dbg_set_i << cacheIndexOff
+                    )
+                    req_b.address.bits.subByteTagSelect := 0.U
+                    
+                    /* Writebacks data through s1_data */
+                    req_b.data := DontCare
+                    dbg_dataArrays_ren := true.B
+                    dbg_dataArrays_ridx := Cat(dbg_set_i, dbg_way_i)
+                }
+
+                /* Advance pointers, if possible */
+                val next_dbg_set_i = Wire(UInt(log2Ceil(tcacheParams.nSets).W))
+                val next_dbg_way_i = Wire(UInt(log2Ceil(tcacheParams.nWays).W))
+                
+                when (!should_advance) {
+                    next_dbg_set_i := dbg_set_i
+                    next_dbg_way_i := dbg_way_i
+                } .otherwise {
+                    when (dbg_way_i === (tcacheParams.nWays - 1).U) {
+                        /* Ways need to roll over, done with this set */
+                        when (dbg_set_i === (tcacheParams.nSets - 1).U) {
+                            /* Done with all sets! We're done! */
+                            dbg_set_request_done := true.B
+                            next_dbg_set_i := DontCare
+                            next_dbg_way_i := DontCare
+                        } .otherwise {
+                            next_dbg_set_i := dbg_set_i + 1.U
+                            next_dbg_way_i := 0.U
+                        }
+
+                        /* 
+                        Invalidate all ways as we're done! 
+                        We avoid a concurrent read-write since meta write always
+                        happens when we're advancing the set pointer.
+                        */
+                        dbg_metaArrays_widx := dbg_set_i
+                        dbg_metaArrays_wmask := VecInit(Seq.fill(tcacheParams.nWays)(true.B))
+                        dbg_metaArrays_wdata := VecInit(Seq.fill(tcacheParams.nWays)({
+                            val m = Wire(metaT)
+                            m := DontCare
+                            m.cacheTag.valid := false.B
+                            m
+                        }))
+                    } .otherwise {
+                        next_dbg_set_i := dbg_set_i
+                        next_dbg_way_i := dbg_way_i + 1.U
+                    }
+                }
+
+                /* Launch meta access */
+                dbg_metaArrays_ren := !dbg_set_request_done
+                dbg_metaArrays_ridx := next_dbg_set_i
+                dbg_set_i := next_dbg_set_i
+                dbg_way_i := next_dbg_way_i
+            }
+        }
+    }
+
+    dontTouch(dbg_set_request_done)
+    when (dbg_set_request_done) {
+        dbg_req.valid := false.B
+
+        /* 
+        By clearing the request, we're indicating that the operation is done 
+        */
+        io.core.dbg_tcache_req.wport_wen := true.B
+        io.core.dbg_tcache_req.wport_wdata := 0.U
+    }
+
+    when (dbg_array_access_override) {
+        /* Assert that we have exclusive access while in debug mode */
+        assert(!s0_op_valid && !s1_op_valid && !s2_op_valid, "dbg op not unique?")
+    }
 }
 
 class TCacheMSHRIO(implicit p: Parameters, tcacheParams: TCacheParams) 
