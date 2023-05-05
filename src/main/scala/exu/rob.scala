@@ -292,11 +292,13 @@ class Rob(
   val rob_unsafe_masked = WireInit(VecInit(Seq.fill(numRobRows << log2Ceil(coreWidth)){false.B}))
 
   // Used for trace port, for debug purposes only
-  val rob_debug_inst_mem   = SyncReadMem(numRobRows, Vec(coreWidth, UInt(32.W)))
+  val rob_debug_inst_mem   = if (trace) SyncReadMem(numRobRows, Vec(coreWidth, UInt(32.W))) else null
   val rob_debug_inst_wmask = WireInit(VecInit(0.U(coreWidth.W).asBools))
   val rob_debug_inst_wdata = Wire(Vec(coreWidth, UInt(32.W)))
-  rob_debug_inst_mem.write(rob_tail, rob_debug_inst_wdata, rob_debug_inst_wmask)
-  val rob_debug_inst_rdata = rob_debug_inst_mem.read(rob_head, will_commit.reduce(_||_))
+  if (trace) {
+    rob_debug_inst_mem.write(rob_tail, rob_debug_inst_wdata, rob_debug_inst_wmask)
+  }
+  val rob_debug_inst_rdata = if (trace) rob_debug_inst_mem.read(rob_head, will_commit.reduce(_||_)) else null
 
   for (w <- 0 until coreWidth) {
     def MatchBank(bank_idx: UInt): Bool = (bank_idx === w.U)
@@ -407,7 +409,11 @@ class Rob(
     io.commit.valids(w) := will_commit(w)
     io.commit.arch_valids(w) := will_commit(w) && !rob_predicated(com_idx)
     io.commit.uops(w)   := rob_uop(com_idx)
-    io.commit.debug_insts(w) := rob_debug_inst_rdata(w)
+    if (trace) {
+      io.commit.debug_insts(w) := rob_debug_inst_rdata(w) 
+    } else {
+      io.commit.debug_insts(w) := DontCare
+    }
 
     // We unbusy branches in b1, but its easier to mark the taken/provider src in b2,
     // when the branch might be committing
